@@ -2131,10 +2131,15 @@ impl App {
         };
 
         if let Some(text) = text {
+            #[cfg(not(target_os = "android"))]
             match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
                 Ok(_) => self.set_status("Copied to clipboard"),
                 Err(_) => self.set_status("Failed to copy"),
             }
+            #[cfg(target_os = "android")]
+            let _ = text; // arboard has no Android backend; the yank key is a no-op here.
+            #[cfg(target_os = "android")]
+            self.set_status("Clipboard not supported on Android");
         }
     }
 

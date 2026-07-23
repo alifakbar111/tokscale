@@ -121,6 +121,11 @@ function resolveTargetPackageName(): string | null {
     return null;
   }
 
+  if (process.platform === "android") {
+    if (arch === "arm64") return "cli-android-arm64";
+    return null;
+  }
+
   if (process.platform === "win32") {
     if (arch === "arm64") return "cli-win32-arm64-msvc";
     if (arch === "x64") return "cli-win32-x64-msvc";
@@ -151,6 +156,11 @@ function resolveRustTargetTriple(): string | null {
         ? "x86_64-unknown-linux-musl"
         : "x86_64-unknown-linux-gnu";
     }
+    return null;
+  }
+
+  if (process.platform === "android") {
+    if (arch === "arm64") return "aarch64-linux-android";
     return null;
   }
 
