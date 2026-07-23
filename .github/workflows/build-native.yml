@@ -57,6 +57,17 @@ jobs:
             build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-musl
             strip: ""
             bin_name: tokscale
+          # Android (Termux) on aarch64. Requires the Android NDK cross
+          # toolchain (Bionic libc) — zigbuild does not apply here. The
+          # taiki-e/setup-cross-toolchain-action installs the NDK r26d and
+          # wires CC_aarch64_linux_android / AR_aarch64_linux_android so
+          # `cargo build --target aarch64-linux-android` links against
+          # Bionic via the NDK's clang/lld.
+          - host: ubuntu-latest
+            target: aarch64-linux-android
+            build: cargo build --release -p tokscale-cli --target aarch64-linux-android
+            strip: ""
+            bin_name: tokscale
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             build: cargo build --release -p tokscale-cli --target x86_64-pc-windows-msvc
@@ -102,6 +113,13 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           tool: cargo-zigbuild
+
+      - name: Setup Android cross toolchain
+        if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-linux-android
+          android-ndk: r26d
 
       - name: Build CLI binary
         run: ${{ matrix.settings.build }}

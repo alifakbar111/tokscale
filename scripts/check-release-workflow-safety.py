@@ -19,6 +19,7 @@ TARGET_PACKAGES = {
     "aarch64-unknown-linux-musl": "cli-linux-arm64-musl",
     "x86_64-pc-windows-msvc": "cli-win32-x64-msvc",
     "aarch64-pc-windows-msvc": "cli-win32-arm64-msvc",
+    "aarch64-linux-android": "cli-android-arm64",
 }
 
 

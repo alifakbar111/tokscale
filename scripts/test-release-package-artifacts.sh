@@ -42,6 +42,7 @@ const rows = [
   ["cli-linux-arm64-musl", "cli-binary-aarch64-unknown-linux-musl", "tokscale"],
   ["cli-win32-x64-msvc", "cli-binary-x86_64-pc-windows-msvc", "tokscale.exe"],
   ["cli-win32-arm64-msvc", "cli-binary-aarch64-pc-windows-msvc", "tokscale.exe"],
+  ["cli-android-arm64", "cli-binary-aarch64-linux-android", "tokscale"],
 ];
 for (const row of rows) {
   console.log(row.join("\t"));
@@ -123,6 +124,9 @@ if (process.platform === "darwin") {
 } else if (process.platform === "win32") {
   if (arch === "arm64") console.log("cli-win32-arm64-msvc");
   else if (arch === "x64") console.log("cli-win32-x64-msvc");
+  else process.exit(1);
+} else if (process.platform === "android") {
+  if (arch === "arm64") console.log("cli-android-arm64");
   else process.exit(1);
 } else {
   process.exit(1);

@@ -112,6 +112,9 @@ if (process.platform === "darwin") {
   if (arch === "arm64") console.log(libc === "musl" ? "cli-linux-arm64-musl" : "cli-linux-arm64-gnu");
   else if (arch === "x64") console.log(libc === "musl" ? "cli-linux-x64-musl" : "cli-linux-x64-gnu");
   else process.exit(1);
+} else if (process.platform === "android") {
+  if (arch === "arm64") console.log("cli-android-arm64");
+  else process.exit(1);
 } else {
   process.exit(1);
 }

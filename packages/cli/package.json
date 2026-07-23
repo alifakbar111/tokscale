@@ -36,7 +36,8 @@
     "@tokscale/cli-linux-arm64-gnu": "4.7.0",
     "@tokscale/cli-linux-arm64-musl": "4.7.0",
     "@tokscale/cli-win32-x64-msvc": "4.7.0",
-    "@tokscale/cli-win32-arm64-msvc": "4.7.0"
+    "@tokscale/cli-win32-arm64-msvc": "4.7.0",
+    "@tokscale/cli-android-arm64": "4.7.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

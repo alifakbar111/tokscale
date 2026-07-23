@@ -202,6 +202,15 @@ jobs:
             bin_name: tokscale
             build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-musl
             strip: ""
+          # Android (Termux) on aarch64: links against Bionic via NDK r26d.
+          # See build-native.yml for the matching toolchain setup.
+          - host: ubuntu-latest
+            target: aarch64-linux-android
+            package_dir: cli-android-arm64
+            artifact_name: cli-binary-aarch64-linux-android
+            bin_name: tokscale
+            build: cargo build --release -p tokscale-cli --target aarch64-linux-android
+            strip: ""
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             package_dir: cli-win32-x64-msvc
@@ -259,6 +268,13 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           tool: cargo-zigbuild
+
+      - name: Setup Android cross toolchain
+        if: ${{ matrix.settings.target == 'aarch64-linux-android' }}
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: aarch64-linux-android
+          android-ndk: r26d
 
       - name: Build CLI binary
         shell: bash
@@ -413,6 +429,10 @@ jobs:
           - package_name: '@tokscale/cli-linux-arm64-musl'
             package_dir: cli-linux-arm64-musl
             artifact_name: cli-binary-aarch64-unknown-linux-musl
+            binary_name: tokscale
+          - package_name: '@tokscale/cli-android-arm64'
+            package_dir: cli-android-arm64
+            artifact_name: cli-binary-aarch64-linux-android
             binary_name: tokscale
           - package_name: '@tokscale/cli-win32-x64-msvc'
             package_dir: cli-win32-x64-msvc
