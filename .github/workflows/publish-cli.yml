@@ -202,8 +202,11 @@ jobs:
             bin_name: tokscale
             build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-musl
             strip: ""
-          # Android (Termux) on aarch64: links against Bionic via NDK r26d.
-          # See build-native.yml for the matching toolchain setup.
+          # Android (Termux) on aarch64: links against Bionic. The
+          # taiki-e/setup-cross-toolchain-action handles NDK setup
+          # automatically (Clang 14, API 21 by default) and wires the
+          # CC/AR env vars. See build-native.yml for the matching
+          # toolchain setup.
           - host: ubuntu-latest
             target: aarch64-linux-android
             package_dir: cli-android-arm64
@@ -257,13 +260,13 @@ jobs:
           key: cli-${{ matrix.settings.target }}-cargo-${{ matrix.settings.host }}-${{ hashFiles('Cargo.lock') }}
 
       - uses: mlugg/setup-zig@v2
-        if: ${{ contains(matrix.settings.target, 'linux') }}
+        if: ${{ contains(matrix.settings.target, 'linux') && !contains(matrix.settings.target, 'android') }}
         with:
           version: 0.13.0
 
       - name: Install cargo-zigbuild
         uses: taiki-e/install-action@v2
-        if: ${{ contains(matrix.settings.target, 'linux') }}
+        if: ${{ contains(matrix.settings.target, 'linux') && !contains(matrix.settings.target, 'android') }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
@@ -274,14 +277,13 @@ jobs:
         uses: taiki-e/setup-cross-toolchain-action@v1
         with:
           target: aarch64-linux-android
-          android-ndk: r26d
 
       - name: Build CLI binary
         shell: bash
         run: ${{ matrix.settings.build }}
 
       - name: Install cross-compilation strip tool
-        if: contains(matrix.settings.target, 'aarch64') && runner.os == 'Linux'
+        if: contains(matrix.settings.target, 'aarch64') && !contains(matrix.settings.target, 'android') && runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu
 
       - name: Strip CLI binary
