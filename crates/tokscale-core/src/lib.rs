@@ -2215,12 +2215,16 @@ fn parse_all_messages_with_pricing_with_cache_policy(
         }
     }
 
-    // Command Code does not persist token usage or cost locally, so tokens are
-    // estimated and priced. The model id comes from ~/.commandcode/config.json
-    // (canonicalized, e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), not the
-    // transcript, so the source cache — which fingerprints only the transcript
-    // file — is bypassed: otherwise a config.json model change would leave stale
-    // cached pricing until the transcript itself changed.
+    // Command Code's v3 transcripts persist per-request usage and cost
+    // (`usage` with `inputTokens`/`outputTokens`/`cacheReadTokens`/
+    // `cacheWriteTokens`/`costUsd`) on assistant lines, so the parser embeds
+    // provider-reported cost when present. Reprice only messages that carry no
+    // embedded cost, mirroring the gjc/junie lanes' guards. The model id comes
+    // from the transcript's own `model`/`model_change` records (canonicalized,
+    // e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), falling back to
+    // ~/.commandcode/config.json, so the source cache — which fingerprints only
+    // the transcript file — is bypassed: otherwise a model change would leave
+    // stale cached pricing until the transcript itself changed.
     let commandcode_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
@@ -2228,7 +2232,9 @@ fn parse_all_messages_with_pricing_with_cache_policy(
             sessions::commandcode::parse_commandcode_file(path)
                 .into_iter()
                 .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
+                    if msg.cost <= 0.0 {
+                        apply_pricing_if_available(&mut msg, pricing);
+                    }
                     msg
                 })
                 .collect::<Vec<_>>()

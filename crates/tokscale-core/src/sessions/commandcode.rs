@@ -2,39 +2,33 @@
 //!
 //! Parses JSONL transcripts from `~/.commandcode/projects/<slug>/<session>.jsonl`.
 //!
-//! Unlike most sources, Command Code does NOT persist token usage locally: the
-//! CLI computes per-request usage in memory and ships it to its backend
-//! (`api.commandcode.ai`, surfaced in the web Usage dashboard). The on-disk
-//! transcript only contains message text (one JSON object per line with
-//! `role`/`content`/`timestamp`/`sessionId`), so token counts are ESTIMATED
-//! from message text at ~4 characters per token, consistent with tokscale's
-//! other estimated sources (see Kiro).
+//! Command Code's on-disk transcript (version 3) is a stream of typed JSON
+//! records, one per line:
 //!
-//! These estimates approximate tokens processed; they will not match Command
-//! Code's server-reported usage, which reflects tool-output truncation and
-//! auxiliary model runs (e.g. tool-desc, taste-1) absent from the transcript.
+//! - `{"type":"session","version":3,"id":"<session>",...}` — the header, which
+//!   carries the session id that every message line also repeats.
+//! - `{"type":"message","id":...,"timestamp":...,"message":{"role":...,"content":[...]},"usage":{...},"model":"provider/model"}` —
+//!   conversation entries. Assistant responses carry an authoritative `usage`
+//!   block (`inputTokens`, `outputTokens`, `cacheReadTokens`,
+//!   `cacheWriteTokens`, `costUsd`) plus the `model` in effect for that call.
+//! - `{"type":"model_change","timestamp":...,"model":"provider/model"}` —
+//!   mid-session model switches.
 //!
-//! **Input estimation is per-turn, not cumulative.**
-//! Command Code stores no local token counts and re-sends prior context on each
-//! request, but the on-disk transcript does not say how much of that context is
-//! cached versus re-billed. Each assistant turn's input is therefore estimated
-//! from only the *new* context that turn introduced — the user prompt plus any
-//! tool results since the previous assistant response — and attributed entirely
-//! as fresh (non-cached) input (`cache_read = 0`). Counting the *cumulative*
-//! conversation context on every turn instead (the previous behavior) grows the
-//! per-turn input across the session, costs O(N^2) characters scanned for an
-//! N-turn session, and inflates reported input far beyond comparable clients.
-//! The per-turn delta sums to each message's own content exactly once across the
-//! whole session, which is the same accounting other estimated clients use.
-//! Whether re-sent context should be attributed to `cache_read` remains a
-//! maintainer decision requiring Command Code's real billing model, which is not
-//! available from the transcript. Do not silently change the estimation model
-//! without a corresponding update to this doc-comment and the pinning test
-//! `test_commandcode_input_is_per_turn_delta`.
+//! Unlike earlier versions of this parser (which assumed Command Code never
+//! persisted usage locally and estimated tokens at ~4 chars/token from message
+//! text), the v3 transcript DOES persist per-request usage and cost. When a
+//! message line carries a `usage` block, its token counts and `costUsd` are
+//! used verbatim and marked provider-reported, so the cost is not overwritten
+//! by tokscale's estimated pricing. Lines without `usage` (e.g. user turns,
+//! tool results) contribute nothing themselves — the assistant turn that
+//! follows them carries the full request accounting.
 //!
-//! Output is estimated from the assistant message's own content. The model id
-//! is not stored per message, so it is read from `~/.commandcode/config.json`
-//! (the configured agent model), falling back to "unknown".
+//! The model id is read from the line's own `model` field, falling back to the
+//! most recent `model_change` event, then to `~/.commandcode/config.json` (the
+//! configured agent model), then to "unknown". Gateway ids such as
+//! `MiniMaxAI/MiniMax-M3-Free` are canonicalized by dropping the org prefix and
+//! the `-Free` promo suffix so pricing resolves to the real model key, and the
+//! provider hint carried in the id (e.g. `minimax`) is recovered the same way.
 
 use super::utils::{
     estimate_tokens, file_modified_timestamp_ms, for_each_json_line, session_id_from_path,
@@ -49,13 +43,69 @@ const CLIENT_ID: &str = "commandcode";
 const PROVIDER_ID: &str = "command-code";
 const UNKNOWN_MODEL: &str = "unknown";
 
+/// One JSONL record in a Command Code v3 transcript.
+///
+/// Only the fields this parser needs are modeled; everything else
+/// (`parentId`, `meta`, `effort`, …) is ignored by serde.
 #[derive(Debug, Deserialize)]
 struct CommandCodeEntry {
+    #[serde(rename = "type")]
+    record_type: Option<String>,
+    id: Option<String>,
+    timestamp: Option<String>,
+    /// The conversation entry, present on `type == "message"` records.
+    message: Option<CommandCodeMessage>,
+    /// Authoritative usage block, present on assistant response lines.
+    usage: Option<CommandCodeUsage>,
+    /// The model in effect for this record (message or model_change).
+    model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandCodeMessage {
     role: Option<String>,
     content: Option<serde_json::Value>,
-    timestamp: Option<String>,
-    #[serde(rename = "sessionId")]
-    session_id: Option<String>,
+}
+
+/// The camelCase usage block Command Code persists on assistant responses.
+#[derive(Debug, Deserialize)]
+struct CommandCodeUsage {
+    #[serde(rename = "inputTokens")]
+    input_tokens: Option<i64>,
+    #[serde(rename = "outputTokens")]
+    output_tokens: Option<i64>,
+    #[serde(rename = "cacheReadTokens")]
+    cache_read_tokens: Option<i64>,
+    #[serde(rename = "cacheWriteTokens")]
+    cache_write_tokens: Option<i64>,
+    #[serde(rename = "costUsd")]
+    cost_usd: Option<f64>,
+}
+
+impl CommandCodeUsage {
+    fn to_breakdown(&self) -> Option<TokenBreakdown> {
+        let input = self.input_tokens.unwrap_or(0).max(0);
+        let output = self.output_tokens.unwrap_or(0).max(0);
+        let cache_read = self.cache_read_tokens.unwrap_or(0).max(0);
+        let cache_write = self.cache_write_tokens.unwrap_or(0).max(0);
+        if input + output + cache_read + cache_write == 0 {
+            return None;
+        }
+        Some(TokenBreakdown {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            reasoning: 0,
+        })
+    }
+
+    /// Authoritative cost in USD, or `None` when absent/not a positive finite
+    /// number. Negative costs are rejected (`-1` is not a real bill).
+    fn reported_cost(&self) -> Option<f64> {
+        self.cost_usd
+            .filter(|cost| cost.is_finite() && *cost >= 0.0 && *cost > 0.0)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,37 +126,21 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
     }
 
     let fallback_timestamp = file_modified_timestamp_ms(path);
-    let raw_model = model_from_config(path);
-    // Recover the real provider from the configured gateway id (e.g.
-    // `MiniMaxAI/MiniMax-M3-Free` -> `minimax`) so pricing resolves to that
-    // provider's catalog. The client's own `command-code` provider is not a
-    // pricing provider, so without this a MiniMax model would never reach a
-    // `minimax/...` key. Falls back to `command-code` when nothing is inferred.
-    let provider_id = raw_model
-        .as_deref()
-        .and_then(provider_hint_for_model)
-        .unwrap_or(PROVIDER_ID);
-    let model_id = raw_model
-        .map(|model| canonicalize_model(&model))
-        .unwrap_or_else(|| UNKNOWN_MODEL.to_string());
     let session_id_from_path = session_id_from_path(path);
-    // Command Code names project directories after a slugified working
-    // directory (e.g. `users-alice-development-repo`). The original path is not
-    // recoverable (lowercased, separators collapsed), so the slug itself is
-    // used as the workspace key.
     let workspace_key = workspace_key_from_path(path);
     let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
 
     let mut messages = Vec::new();
     let mut session_id: Option<String> = None;
+    let mut model_id: Option<String> = None;
     // Char count of the *new* context added since the previous assistant
-    // response (the user prompt plus any tool results for this turn). This
-    // stands in for the input (prompt) tokens of the current request without
-    // re-counting the entire conversation history every turn — counting the
-    // cumulative context instead grows the per-turn input across the session
-    // (O(N^2) total) and inflates input versus other clients.
+    // response (the user prompt plus any tool results for this turn). Only used
+    // for the estimation fallback on transcripts without a `usage` block.
     let mut turn_input_chars: usize = 0;
-    // The first assistant message after a user message starts a new turn.
+    // Tracks whether the most recent non-assistant entry started a user turn,
+    // used to mark the first assistant response of each turn. A response that
+    // is itself the first thing in the transcript (no preceding user record)
+    // is still a turn start.
     let mut pending_turn_start = false;
     let mut assistant_index = 0usize;
 
@@ -117,73 +151,146 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
         };
 
         if session_id.is_none() {
-            if let Some(id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
+            if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
                 session_id = Some(id.to_string());
             }
         }
 
-        let chars = entry.content.as_ref().map(content_chars).unwrap_or(0);
+        // Track the most-recently-seen model: `model_change` records update it
+        // without emitting anything, and message records carry the model in
+        // effect for that call.
+        if let Some(model) = entry.model.as_deref().filter(|model| !model.is_empty()) {
+            model_id = Some(model.to_string());
+        }
 
-        match entry.role.as_deref() {
-            Some("assistant") => {
-                let input = estimate_tokens(turn_input_chars);
-                let output = estimate_tokens(chars);
-                // This turn's input has been consumed; the next turn's input is
-                // only the *new* context that follows this response. The
-                // assistant's own output is not part of any input estimate.
-                turn_input_chars = 0;
-
-                if input + output == 0 {
-                    pending_turn_start = false;
+        match entry.record_type.as_deref() {
+            // A `model_change` record updates the model in effect; nothing to
+            // emit (handled above by the shared model tracking).
+            Some("model_change") => {}
+            Some("message") | _ => {
+                let Some(message) = entry.message.as_ref() else {
                     return;
+                };
+                let Some(role) = message.role.as_deref() else {
+                    return;
+                };
+
+                let chars = message.content.as_ref().map(content_chars).unwrap_or(0);
+
+                if role == "assistant" {
+                    // Prefer authoritative usage; fall back to estimating from
+                    // the per-turn delta of message content when no usage block
+                    // is present (older transcripts).
+                    let breakdown = entry
+                        .usage
+                        .as_ref()
+                        .and_then(CommandCodeUsage::to_breakdown)
+                        .unwrap_or_else(|| {
+                            let input = estimate_tokens(turn_input_chars);
+                            let output = estimate_tokens(chars);
+                            TokenBreakdown {
+                                input,
+                                output,
+                                cache_read: 0,
+                                cache_write: 0,
+                                reasoning: 0,
+                            }
+                        });
+                    turn_input_chars = 0;
+
+                    if breakdown.total() == 0 {
+                        pending_turn_start = false;
+                        return;
+                    }
+
+                    let resolved_session = session_id
+                        .clone()
+                        .unwrap_or_else(|| session_id_from_path.clone());
+                    // Resolve the raw model: the line's own `model` (or the most
+                    // recent `model_change`), else the configured agent model,
+                    // else "unknown".
+                    let raw_model = match model_id {
+                        Some(ref model) => model.clone(),
+                        None => {
+                            model_from_config(path).unwrap_or_else(|| UNKNOWN_MODEL.to_string())
+                        }
+                    };
+                    let resolved_model = canonicalize_model(&raw_model);
+                    // Recover the real provider from the model id (e.g.
+                    // `MiniMaxAI/MiniMax-M3-Free` -> `minimax`) so pricing
+                    // resolves to that provider's catalog. The client's own
+                    // `command-code` provider is not a pricing provider, so
+                    // without this a MiniMax model would never reach a
+                    // `minimax/...` key. Falls back to `command-code` when
+                    // nothing is inferred.
+                    let provider_id =
+                        provider_hint_for_model(&resolved_model).unwrap_or(PROVIDER_ID);
+                    let timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_ms)
+                        .unwrap_or(fallback_timestamp);
+
+                    let cost = entry.usage.as_ref().and_then(|u| u.reported_cost());
+                    let mut message = UnifiedMessage::new_with_dedup(
+                        CLIENT_ID,
+                        resolved_model,
+                        provider_id,
+                        resolved_session.clone(),
+                        timestamp,
+                        breakdown,
+                        cost.unwrap_or(0.0),
+                        Some(format!("{}:{}", resolved_session, assistant_index)),
+                    );
+                    message.message_count = 1;
+                    message.is_turn_start = pending_turn_start;
+                    message.set_workspace(workspace_key.clone(), workspace_label.clone());
+                    if cost.is_some() {
+                        message.mark_provider_reported_cost();
+                    }
+                    messages.push(message);
+
+                    assistant_index += 1;
+                    pending_turn_start = false;
+                } else if role == "user" {
+                    // A tool result is delivered under `role: "user"` but is a
+                    // continuation of the current turn, not a new prompt — it
+                    // must not start a new turn. Only a genuine user text
+                    // prompt does.
+                    if !is_tool_result(&message.content) {
+                        pending_turn_start = true;
+                    }
+                    turn_input_chars += chars;
+                } else {
+                    // Tool results (and any other roles) are part of the new
+                    // context the model sees on the next turn.
+                    turn_input_chars += chars;
                 }
-
-                let resolved_session = session_id
-                    .clone()
-                    .unwrap_or_else(|| session_id_from_path.clone());
-                let timestamp = entry
-                    .timestamp
-                    .as_deref()
-                    .and_then(parse_rfc3339_ms)
-                    .unwrap_or(fallback_timestamp);
-
-                let mut message = UnifiedMessage::new_with_dedup(
-                    CLIENT_ID,
-                    model_id.clone(),
-                    provider_id,
-                    resolved_session.clone(),
-                    timestamp,
-                    TokenBreakdown {
-                        input,
-                        output,
-                        cache_read: 0,
-                        cache_write: 0,
-                        reasoning: 0,
-                    },
-                    0.0,
-                    Some(format!("{}:{}", resolved_session, assistant_index)),
-                );
-                message.message_count = 1;
-                message.is_turn_start = pending_turn_start;
-                message.set_workspace(workspace_key.clone(), workspace_label.clone());
-                messages.push(message);
-
-                assistant_index += 1;
-                pending_turn_start = false;
-            }
-            Some("user") => {
-                pending_turn_start = true;
-                turn_input_chars += chars;
-            }
-            // Tool results (and any other roles) are part of the new context the
-            // model sees on the next turn.
-            _ => {
-                turn_input_chars += chars;
             }
         }
     });
 
     messages
+}
+
+/// Whether a user-role content block is a tool result (a continuation of the
+/// current turn) rather than a genuine new user prompt.
+///
+/// Command Code delivers tool results under `role: "user"` with content blocks
+/// of `type: "tool_result"`, so a plain role check would start a new turn for
+/// every tool result. The first content block's type is decisive: a real
+/// prompt carries `type: "text"` (or a string/object form in older
+/// transcripts).
+fn is_tool_result(content: &Option<serde_json::Value>) -> bool {
+    match content {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(serde_json::Value::as_object)
+            .any(|block| {
+                block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+            }),
+        _ => false,
+    }
 }
 
 /// Char count of a message's `content` for token estimation, measured from its
@@ -205,14 +312,14 @@ fn content_chars(content: &serde_json::Value) -> usize {
     }
 }
 
-/// Canonicalize the configured model id for pricing. Command Code reports
-/// gateway ids such as `MiniMaxAI/MiniMax-M3-Free`; the `-Free` suffix is a
-/// temporary promo and the org prefix is not a key tokscale's pricing resolver
-/// recognizes verbatim. Dropping the org segment yields the real paid model
-/// (e.g. `MiniMax-M3`) so output pricing resolves; the provider hint that the
-/// org segment carried (e.g. `minimax`) is recovered separately by
-/// [`provider_hint_for_model`] and applied to `provider_id`, so pricing keys
-/// like `minimax/minimax-m3` are still reached.
+/// Canonicalize the model id for pricing. Command Code reports gateway ids such
+/// as `MiniMaxAI/MiniMax-M3-Free`; the `-Free` suffix is a temporary promo and
+/// the org prefix is not a key tokscale's pricing resolver recognizes verbatim.
+/// Dropping the org segment yields the real paid model (e.g. `MiniMax-M3`) so
+/// output pricing resolves; the provider hint that the org segment carried
+/// (e.g. `minimax`) is recovered separately by [`provider_hint_for_model`] and
+/// applied to `provider_id`, so pricing keys like `minimax/minimax-m3` are
+/// still reached.
 fn canonicalize_model(model: &str) -> String {
     let base = model.rsplit('/').next().unwrap_or(model);
     // Char-safe, case-insensitive suffix strip. The original code byte-sliced
@@ -233,7 +340,7 @@ fn canonicalize_model(model: &str) -> String {
     }
 }
 
-/// Recover the provider hint that the configured model id carries (e.g.
+/// Recover the provider hint that the model id carries (e.g.
 /// `MiniMaxAI/MiniMax-M3-Free` -> `minimax`) so pricing resolves to the real
 /// provider's catalog. Command Code's own `command-code` provider id is not a
 /// pricing provider, so without this hint a MiniMax model would never reach a
@@ -283,9 +390,233 @@ mod tests {
         write!(file, r#"{{"provider":"command-code","model":"{model}"}}"#).unwrap();
     }
 
+    /// Build a realistic v3 transcript line for an assistant response carrying
+    /// authoritative usage and cost.
+    fn assistant_line(
+        id: &str,
+        timestamp: &str,
+        model: &str,
+        text: &str,
+        input: i64,
+        output: i64,
+        cache_read: i64,
+        cost_usd: f64,
+    ) -> String {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": null,
+            "timestamp": timestamp,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}]
+            },
+            "usage": {
+                "inputTokens": input,
+                "outputTokens": output,
+                "cacheReadTokens": cache_read,
+                "cacheWriteTokens": 0,
+                "costUsd": cost_usd
+            },
+            "model": model
+        })
+        .to_string()
+    }
+
+    fn user_line(id: &str, timestamp: &str, text: &str) -> String {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": null,
+            "timestamp": timestamp,
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}]
+            }
+        })
+        .to_string()
+    }
+
+    /// A tool-result record, as Command Code writes it after a tool call.
+    fn tool_result_line(id: &str, timestamp: &str, tool_use_id: &str, text: &str) -> String {
+        json!({
+            "type": "message",
+            "id": id,
+            "parentId": null,
+            "timestamp": timestamp,
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": [{"type": "text", "text": text}]
+                }]
+            }
+        })
+        .to_string()
+    }
+
+    /// Full realistic v3 session: header, model_change, user turn, tool call +
+    /// tool result, then the assistant response carrying authoritative usage.
+    #[test]
+    fn test_parse_realistic_v3_session_with_tool_turns() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "deepseek/deepseek-v4-flash");
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "sess-1", "timestamp": "2026-08-31T04:36:38.441Z", "cwd": "/home/al/learning"}),
+            json!({"type": "model_change", "id": "m1", "parentId": null, "timestamp": "2026-08-31T04:37:00.000Z", "model": "deepseek/deepseek-v4-flash"}),
+            user_line("u1", "2026-08-31T04:39:16.867Z", "list the repo"),
+            json!({
+                "type": "message",
+                "id": "t1",
+                "parentId": "u1",
+                "timestamp": "2026-08-31T04:39:18.000Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "call_00_abc",
+                        "name": "read_directory",
+                        "input": {"path": "/home/al/learning"}
+                    }],
+                    "meta": {"source": "model"}
+                },
+                "usage": {
+                    "inputTokens": 21000,
+                    "outputTokens": 90,
+                    "cacheReadTokens": 4000,
+                    "cacheWriteTokens": 0,
+                    "costUsd": 0.002
+                },
+                "model": "deepseek/deepseek-v4-flash"
+            }),
+            tool_result_line(
+                "r1",
+                "2026-08-31T04:39:19.000Z",
+                "call_00_abc",
+                "Found 28 items"
+            ),
+            assistant_line(
+                "a1",
+                "2026-08-31T04:39:20.351Z",
+                "deepseek/deepseek-v4-flash",
+                "There are 28 items.",
+                28534,
+                205,
+                7424,
+                0.006464748
+            ),
+        );
+        let path = write_session(&dir, "home-al-learning", "sess-1", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+
+        // Two assistant records: the tool_use call (turn start) and the final
+        // text response. Both carry authoritative usage.
+        assert_eq!(messages.len(), 2);
+        let tool_call = &messages[0];
+        assert_eq!(tool_call.model_id, "deepseek-v4-flash");
+        assert_eq!(tool_call.provider_id, "deepseek");
+        assert_eq!(tool_call.tokens.input, 21000);
+        assert_eq!(tool_call.tokens.output, 90);
+        assert!((tool_call.cost - 0.002).abs() < 1e-9);
+        assert!(tool_call.has_authoritative_cost());
+        assert!(tool_call.is_turn_start);
+        assert_eq!(tool_call.dedup_key.as_deref(), Some("sess-1:0"));
+
+        let msg = &messages[1];
+        assert_eq!(msg.model_id, "deepseek-v4-flash");
+        assert_eq!(msg.provider_id, "deepseek");
+        assert_eq!(msg.session_id, "sess-1");
+        // Authoritative usage from the assistant line, not estimated from the
+        // tool-result text (which is far larger than 205 output tokens).
+        assert_eq!(msg.tokens.input, 28534);
+        assert_eq!(msg.tokens.output, 205);
+        assert_eq!(msg.tokens.cache_read, 7424);
+        assert!((msg.cost - 0.006464748).abs() < 1e-9);
+        assert!(msg.has_authoritative_cost());
+        assert!(!msg.is_turn_start);
+        assert_eq!(msg.dedup_key.as_deref(), Some("sess-1:1"));
+    }
+
+    #[test]
+    fn test_parse_v3_transcript_with_authoritative_usage() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "deepseek/deepseek-v4-flash");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "sess-1", "cwd": "/home/al/learning"}),
+            user_line("u1", "2026-08-31T04:39:16.867Z", "hello"),
+            assistant_line(
+                "a1",
+                "2026-08-31T04:39:20.351Z",
+                "deepseek/deepseek-v4-flash",
+                "hi there",
+                28534,
+                205,
+                7424,
+                0.006464748
+            ),
+        );
+        let path = write_session(&dir, "home-al-learning", "sess-1", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.client, "commandcode");
+        assert_eq!(msg.provider_id, "deepseek");
+        assert_eq!(msg.model_id, "deepseek-v4-flash");
+        assert_eq!(msg.session_id, "sess-1");
+        // Authoritative counts, not estimates.
+        assert_eq!(msg.tokens.input, 28534);
+        assert_eq!(msg.tokens.output, 205);
+        assert_eq!(msg.tokens.cache_read, 7424);
+        assert_eq!(msg.tokens.cache_write, 0);
+        assert_eq!(msg.tokens.reasoning, 0);
+        // Authoritative cost is embedded and marked provider-reported.
+        assert!((msg.cost - 0.006464748).abs() < 1e-9);
+        assert!(msg.has_authoritative_cost());
+        assert!(msg.is_turn_start);
+        assert_eq!(msg.message_count, 1);
+        assert_eq!(msg.timestamp, 1788151160351); // 2026-08-31T04:39:20.351Z
+        assert_eq!(msg.workspace_key.as_deref(), Some("home-al-learning"));
+    }
+
+    #[test]
+    fn test_parse_v3_transcript_model_change_updates_model() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "deepseek/deepseek-v4-flash");
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "sess-1"}),
+            json!({"type": "model_change", "id": "m1", "timestamp": "2026-08-31T03:32:29.603Z", "model": "minimax/minimax-m3-free"}),
+            user_line("u1", "2026-08-31T03:33:00.000Z", "first"),
+            assistant_line(
+                "a1",
+                "2026-08-31T03:33:05.000Z",
+                "minimax/minimax-m3-free",
+                "resp one",
+                100,
+                10,
+                0,
+                0.001
+            ),
+            json!({"type": "model_change", "id": "m2", "timestamp": "2026-08-31T03:34:07.747Z", "model": "deepseek/deepseek-v4-flash"}),
+        );
+        let path = write_session(&dir, "proj", "sess-1", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        // The model in effect at the assistant line is the model_change one.
+        assert_eq!(messages[0].model_id, "minimax-m3");
+        assert_eq!(messages[0].provider_id, "minimax");
+    }
+
     #[test]
     fn test_canonicalize_model_strips_org_prefix_and_free_promo_suffix() {
-        // "-Free" is a temporary promo; the org prefix mis-resolves pricing.
         assert_eq!(
             canonicalize_model("MiniMaxAI/MiniMax-M3-Free"),
             "MiniMax-M3"
@@ -296,277 +627,22 @@ mod tests {
         );
         assert_eq!(canonicalize_model("MiniMaxAI/MiniMax-M2.5"), "MiniMax-M2.5");
         assert_eq!(canonicalize_model("taste-1"), "taste-1");
-        // Mixed-case promo suffix is still stripped (case-insensitive match).
         assert_eq!(canonicalize_model("MiniMax-M3-FrEe"), "MiniMax-M3");
     }
 
-    /// Regression: a non-ASCII model id from the untrusted
-    /// `~/.commandcode/config.json` must not panic. The previous implementation
-    /// byte-sliced `base[base.len() - 5..]` guarded only by a length check; for
-    /// an id whose final 5 bytes straddle a multi-byte UTF-8 codepoint that
-    /// slice panics (byte index not on a char boundary).
     #[test]
     fn test_canonicalize_model_does_not_panic_on_non_ascii() {
-        // "modèle" ends with the multi-byte 'è' inside the last 5 bytes.
         assert_eq!(canonicalize_model("vendor/modèle"), "modèle");
-        // Emoji at the tail: last bytes are deep inside a 4-byte codepoint.
         assert_eq!(canonicalize_model("café-🚀"), "café-🚀");
-        // A non-ASCII id that nonetheless ends in the promo suffix still strips.
         assert_eq!(canonicalize_model("café-free"), "café");
     }
 
     #[test]
     fn test_content_chars_counts_keys_numbers_and_nested_payloads() {
-        // Structured tool args/results carry meaning in keys and primitive
-        // values; a string-only counter would return 0 for numeric content.
         assert!(content_chars(&json!([{"value": 12345}])) > 0);
         let small = content_chars(&json!([{"a": "x"}]));
         let large = content_chars(&json!([{"command": "run", "args": ["a", "b"], "n": 42}]));
         assert!(large > small);
-    }
-
-    #[test]
-    fn test_parse_canonicalizes_model_and_estimates_tokens() {
-        let dir = TempDir::new().unwrap();
-        write_config(&dir, "MiniMaxAI/MiniMax-M3-Free");
-        let user = json!([{"type": "text", "text": "12345678"}]);
-        let assistant = json!([{"type": "text", "text": "abcd"}]);
-        let jsonl = format!(
-            "{}\n{}",
-            json!({"role": "user", "sessionId": "sess-1", "timestamp": "2026-06-16T05:58:15.580Z", "content": user.clone()}),
-            json!({"role": "assistant", "sessionId": "sess-1", "timestamp": "2026-06-16T05:58:20.332Z", "content": assistant.clone()}),
-        );
-        let path = write_session(&dir, "users-alice-repo", "sess-1", &jsonl);
-
-        let messages = parse_commandcode_file(&path);
-
-        assert_eq!(messages.len(), 1);
-        let msg = &messages[0];
-        assert_eq!(msg.client, "commandcode");
-        // Provider is recovered from the gateway id (MiniMaxAI -> minimax) so
-        // pricing resolves against the `minimax/...` catalog, not `command-code`.
-        assert_eq!(msg.provider_id, "minimax");
-        // Promo suffix + org prefix stripped so pricing hits the real model.
-        assert_eq!(msg.model_id, "MiniMax-M3");
-        assert_eq!(msg.session_id, "sess-1");
-        // Input = context before this turn (just the user message); output = this
-        // assistant message. Computed from the same helper to avoid brittle counts.
-        assert_eq!(msg.tokens.input, estimate_tokens(content_chars(&user)));
-        assert_eq!(
-            msg.tokens.output,
-            estimate_tokens(content_chars(&assistant))
-        );
-        assert!(msg.tokens.input > 0 && msg.tokens.output > 0);
-        assert_eq!(msg.message_count, 1);
-        assert!(msg.is_turn_start);
-        assert_eq!(msg.timestamp, 1781589500332); // 2026-06-16T05:58:20.332Z
-        assert_eq!(msg.workspace_key.as_deref(), Some("users-alice-repo"));
-        assert_eq!(msg.workspace_label.as_deref(), Some("users-alice-repo"));
-    }
-
-    /// Per-turn input does NOT accumulate prior turns: each assistant turn is
-    /// charged only for the new context (user + tool results) introduced since
-    /// the previous response. A long, expensive turn must not permanently
-    /// inflate later, cheaper turns — the previous cumulative implementation
-    /// would have made turn 2 strictly larger than turn 1 here, so this test
-    /// fails without the per-turn-delta fix.
-    #[test]
-    fn test_input_is_per_turn_delta_not_cumulative() {
-        let dir = TempDir::new().unwrap();
-        write_config(&dir, "model-x");
-        // Turn 1 carries a large user prompt; turn 2 carries only a tiny one.
-        // With cumulative counting turn 2 would still include all of turn 1 and
-        // therefore exceed it; with per-turn deltas turn 2 is much smaller.
-        let jsonl = concat!(
-            r#"{"role":"user","sessionId":"s","content":[{"type":"text","text":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
-            "\n",
-            r#"{"role":"assistant","sessionId":"s","content":[{"type":"text","text":"bbbb"}]}"#,
-            "\n",
-            r#"{"role":"user","sessionId":"s","content":[{"type":"text","text":"d"}]}"#,
-            "\n",
-            r#"{"role":"assistant","sessionId":"s","content":[{"type":"text","text":"e"}]}"#,
-        );
-        let path = write_session(&dir, "proj", "s", jsonl);
-
-        let messages = parse_commandcode_file(&path);
-
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].tokens.input > 0);
-        assert!(messages[0].is_turn_start);
-        assert!(messages[1].is_turn_start);
-        // Turn 2's input reflects only its own small delta (tool result + tiny
-        // user prompt), which here is smaller than turn 1's big prompt. The old
-        // cumulative model would have made this strictly greater.
-        assert!(
-            messages[1].tokens.input < messages[0].tokens.input,
-            "turn 2 input ({}) must reflect only its own delta, not the cumulative \
-             history that included turn 1 ({})",
-            messages[1].tokens.input,
-            messages[0].tokens.input
-        );
-    }
-
-    /// Pins the per-turn-delta input estimation so a future refactor cannot
-    /// silently reintroduce cumulative (O(N^2)) counting or otherwise change
-    /// leaderboard numbers.
-    ///
-    /// Command Code stores no local token counts, so each assistant turn's input
-    /// is estimated from only the *new* context that turn introduced (the user
-    /// prompt plus any tool results since the previous response) and is
-    /// attributed entirely as fresh non-cached input (`cache_read = 0`). Summed
-    /// over the session this charges every message's content exactly once. See
-    /// the module-level doc-comment for the rationale; changing the model
-    /// requires a maintainer decision with real billing data.
-    ///
-    /// The exact token values asserted here are load-bearing: they reflect the
-    /// current ~4 chars/token heuristic applied to the per-turn char deltas of
-    /// the synthetic session below. If this test starts failing after an
-    /// unrelated refactor, that is intentional — update the values AND the
-    /// module doc-comment together, not just this test.
-    #[test]
-    fn test_commandcode_input_is_per_turn_delta() {
-        let dir = TempDir::new().unwrap();
-        write_config(&dir, "model-x");
-
-        // Synthetic 2-turn session with known, fixed content so token counts
-        // are deterministic regardless of serde_json key ordering.
-        //
-        // Turn 1:
-        //   user:      content = [{"type":"text","text":"aaaa"}]
-        //   assistant: content = [{"type":"text","text":"bbbb"}]
-        //
-        // Turn 2:
-        //   user:      content = [{"type":"text","text":"cccc"}]
-        //   assistant: content = [{"type":"text","text":"dddd"}]
-        //
-        // We pre-compute the expected per-turn char deltas and expected tokens
-        // from the same helpers used by the parser to keep the assertions
-        // self-consistent without hard-coding magic numbers.
-        let user1_content = json!([{"type": "text", "text": "aaaa"}]);
-        let asst1_content = json!([{"type": "text", "text": "bbbb"}]);
-        let user2_content = json!([{"type": "text", "text": "cccc"}]);
-        let asst2_content = json!([{"type": "text", "text": "dddd"}]);
-
-        let user1_chars = content_chars(&user1_content);
-        let asst1_chars = content_chars(&asst1_content);
-        let user2_chars = content_chars(&user2_content);
-        let asst2_chars = content_chars(&asst2_content);
-
-        // Turn 1 input = only user1 (the new context before turn 1's response).
-        let expected_input_turn1 = estimate_tokens(user1_chars);
-        // Turn 2 input = only user2 (the new context since turn 1's response);
-        // asst1 is the prior assistant output and is NOT re-counted as input.
-        let expected_input_turn2 = estimate_tokens(user2_chars);
-
-        let jsonl = format!(
-            "{}\n{}\n{}\n{}",
-            json!({"role": "user",      "sessionId": "s", "content": user1_content}),
-            json!({"role": "assistant", "sessionId": "s", "content": asst1_content}),
-            json!({"role": "user",      "sessionId": "s", "content": user2_content}),
-            json!({"role": "assistant", "sessionId": "s", "content": asst2_content}),
-        );
-        let path = write_session(&dir, "proj", "s", &jsonl);
-
-        let messages = parse_commandcode_file(&path);
-
-        assert_eq!(messages.len(), 2, "expected exactly 2 assistant turns");
-
-        let turn1 = &messages[0];
-        let turn2 = &messages[1];
-
-        // Each turn's input is its own delta; turn 2 does NOT accumulate turn 1.
-        assert!(
-            expected_input_turn1 > 0,
-            "turn 1 input must be positive (user1 context non-empty)"
-        );
-        assert!(
-            expected_input_turn2 > 0,
-            "turn 2 input must be positive (user2 context non-empty)"
-        );
-        assert_eq!(
-            turn1.tokens.input, expected_input_turn1,
-            "turn 1 input pinned to its own per-turn delta (user1)"
-        );
-        assert_eq!(
-            turn2.tokens.input, expected_input_turn2,
-            "turn 2 input pinned to its own per-turn delta (user2), not cumulative"
-        );
-        assert_eq!(
-            turn1.tokens.output,
-            estimate_tokens(asst1_chars),
-            "turn 1 output pinned to assistant message estimate"
-        );
-        assert_eq!(
-            turn2.tokens.output,
-            estimate_tokens(asst2_chars),
-            "turn 2 output pinned to assistant message estimate"
-        );
-
-        // cache_read is always 0 — re-sent context is NOT attributed to cache.
-        // Changing this requires a maintainer decision with real billing data.
-        assert_eq!(
-            turn1.tokens.cache_read, 0,
-            "cache_read must be 0 (no cache attribution)"
-        );
-        assert_eq!(
-            turn2.tokens.cache_read, 0,
-            "cache_read must be 0 (no cache attribution)"
-        );
-        assert_eq!(turn1.tokens.cache_write, 0, "cache_write must be 0");
-        assert_eq!(turn2.tokens.cache_write, 0, "cache_write must be 0");
-    }
-
-    /// Regression: a MiniMax model from `config.json` must resolve non-zero
-    /// pricing. Command Code's own `command-code` provider is not a pricing
-    /// provider, so the parser must recover the real provider (`minimax`) from
-    /// the gateway id and drop only the org prefix / `-Free` promo so the model
-    /// matches a `minimax/...` pricing key. Without the provider recovery and
-    /// char-safe canonicalization, `calculate_cost_with_provider` returns 0.
-    #[test]
-    fn test_minimax_model_resolves_nonzero_pricing() {
-        use crate::pricing::{ModelPricing, PricingService};
-        use std::collections::HashMap;
-
-        let dir = TempDir::new().unwrap();
-        write_config(&dir, "MiniMaxAI/MiniMax-M3-Free");
-        let jsonl = concat!(
-            r#"{"role":"user","sessionId":"s","content":[{"type":"text","text":"hello there how are you"}]}"#,
-            "\n",
-            r#"{"role":"assistant","sessionId":"s","content":[{"type":"text","text":"doing great thanks"}]}"#,
-        );
-        let path = write_session(&dir, "proj", "s", jsonl);
-
-        let messages = parse_commandcode_file(&path);
-        assert_eq!(messages.len(), 1);
-        let msg = &messages[0];
-        assert_eq!(msg.model_id, "MiniMax-M3");
-        assert_eq!(msg.provider_id, "minimax");
-
-        // Pricing keyed under the canonical `minimax/...` litellm key, exactly as
-        // the resolver expects for MiniMax models.
-        let mut litellm = HashMap::new();
-        litellm.insert(
-            "minimax/minimax-m3".to_string(),
-            ModelPricing {
-                input_cost_per_token: Some(0.01),
-                output_cost_per_token: Some(0.02),
-                ..Default::default()
-            },
-        );
-        let pricing = PricingService::new(litellm, HashMap::new());
-
-        // Mirror lib::apply_pricing_if_available: cost is computed from the
-        // message's own model_id + provider_id.
-        let cost = pricing.calculate_cost_with_provider(
-            &msg.model_id,
-            Some(&msg.provider_id),
-            &msg.tokens,
-        );
-        assert!(
-            cost > 0.0,
-            "MiniMax model must price non-zero (got {cost}); provider hint or \
-             model canonicalization is dropping the pricing key"
-        );
     }
 
     #[test]
@@ -587,18 +663,20 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_config_falls_back_to_unknown_model() {
+    fn test_missing_config_and_model_falls_back_to_unknown_model() {
         let dir = TempDir::new().unwrap();
-        let jsonl = concat!(
-            r#"{"role":"user","sessionId":"s","content":[{"type":"text","text":"hello"}]}"#,
-            "\n",
-            r#"{"role":"assistant","sessionId":"s","content":[{"type":"text","text":"world"}]}"#,
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "2026-08-31T00:00:00Z", "hello"),
+            assistant_line("a1", "2026-08-31T00:00:05Z", "", "world", 10, 5, 0, 0.0),
         );
-        let path = write_session(&dir, "proj", "s", jsonl);
+        let path = write_session(&dir, "proj", "s", &jsonl);
 
         let messages = parse_commandcode_file(&path);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].model_id, "unknown");
+        assert_eq!(messages[0].provider_id, "command-code");
     }
 
     #[test]
@@ -606,28 +684,55 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_config(&dir, "model-x");
         let jsonl = concat!(
-            r#"{"role":"user","sessionId":"s","content":[{"type":"text","text":"hello"}]}"#,
+            "not valid json at all\n",
+            r#"{"type":"session","version":3,"id":"s"}"#,
             "\n",
-            "not valid json at all",
-            "\n",
-            r#"{"role":"assistant","sessionId":"s","content":[{"type":"text","text":"response"}]}"#,
         );
         let path = write_session(&dir, "proj", "s", jsonl);
 
         let messages = parse_commandcode_file(&path);
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].tokens.input > 0 || messages[0].tokens.output > 0);
+        assert!(messages.is_empty());
     }
 
     #[test]
-    fn test_empty_assistant_with_no_context_is_skipped() {
+    fn test_estimated_fallback_when_usage_absent() {
         let dir = TempDir::new().unwrap();
         write_config(&dir, "model-x");
-        // Assistant with no content and no preceding context -> 0 tokens, skip.
-        let jsonl = r#"{"role":"assistant","sessionId":"s","content":[]}"#;
-        let path = write_session(&dir, "proj", "s", jsonl);
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            json!({
+                "type": "message",
+                "id": "u1",
+                "timestamp": "2026-08-31T00:00:00Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "12345678"}]}
+            }),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "abcd"}]},
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
 
         let messages = parse_commandcode_file(&path);
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        // Estimated: input from the user turn's content, output from assistant.
+        assert_eq!(
+            msg.tokens.input,
+            estimate_tokens(content_chars(
+                &json!([{"type": "text", "text": "12345678"}])
+            ))
+        );
+        assert_eq!(
+            msg.tokens.output,
+            estimate_tokens(content_chars(&json!([{"type": "text", "text": "abcd"}])))
+        );
+        assert_eq!(msg.cost, 0.0);
+        assert!(!msg.has_authoritative_cost());
+        assert!(msg.is_turn_start);
     }
 }
