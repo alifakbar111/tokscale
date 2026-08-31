@@ -111,18 +111,10 @@ impl CommandCodeUsage {
         // (and so the sum below cannot overflow). ~1e12 tokens exceeds any
         // real session by orders of magnitude.
         const TOKEN_CEILING: i64 = 1_000_000_000_000;
-        let raw_input = self.input_tokens.unwrap_or(0).max(0).min(TOKEN_CEILING);
-        let output = self.output_tokens.unwrap_or(0).max(0).min(TOKEN_CEILING);
-        let cache_read = self
-            .cache_read_tokens
-            .unwrap_or(0)
-            .max(0)
-            .min(TOKEN_CEILING);
-        let cache_write = self
-            .cache_write_tokens
-            .unwrap_or(0)
-            .max(0)
-            .min(TOKEN_CEILING);
+        let raw_input = self.input_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
+        let output = self.output_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
+        let cache_read = self.cache_read_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
+        let cache_write = self.cache_write_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let overlap = cache_read.saturating_add(cache_write);
         let input = raw_input.saturating_sub(overlap.min(raw_input));
         // Saturating sum: adversarial near-i64::MAX fields must not overflow
@@ -224,10 +216,11 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
             // A `model_change` record updates the model in effect; nothing to
             // emit (handled above by the shared model tracking).
             Some("model_change") => {}
-            // v3 `message` records, plus legacy flat-schema lines that carry no
-            // `type` at all (`_` arm). Legacy lines put `role`/`content` at the
-            // top level; v3 nests them under `message`.
-            Some("message") | _ => {
+            // Everything else is a conversation record: v3 `message` entries
+            // nest `role`/`content` under `message`, while legacy flat-schema
+            // lines (no `type` at all) put them at the top level. `session`
+            // headers fall through here too and simply produce no message.
+            _ => {
                 let message = match entry.message.as_ref() {
                     Some(message) => message,
                     None if entry.role.is_some() || entry.content.is_some() => {
