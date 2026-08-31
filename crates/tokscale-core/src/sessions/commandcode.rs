@@ -19,9 +19,16 @@
 //! text), the v3 transcript DOES persist per-request usage and cost. When a
 //! message line carries a `usage` block, its token counts and `costUsd` are
 //! used verbatim and marked provider-reported, so the cost is not overwritten
-//! by tokscale's estimated pricing. Lines without `usage` (e.g. user turns,
-//! tool results) contribute nothing themselves — the assistant turn that
-//! follows them carries the full request accounting.
+//! by tokscale's estimated pricing. `inputTokens` is CACHE-INCLUSIVE (it
+//! already contains the `cacheReadTokens`/`cacheWriteTokens` buckets), so the
+//! cache overlap is subtracted from the input bucket — the same
+//! cache-inclusive normalization cline and zcode apply. Lines without `usage`
+//! (user turns, tool results) contribute nothing themselves — the assistant
+//! turn that follows them carries the full request accounting.
+//!
+//! Legacy flat-schema transcripts (`{"role":..., "content":..., ...}` with no
+//! `type`/`message` nesting) are still parsed via the ~4 chars/token estimation
+//! fallback, using the configured agent model from `~/.commandcode/config.json`.
 //!
 //! The model id is read from the line's own `model` field, falling back to the
 //! most recent `model_change` event, then to `~/.commandcode/config.json` (the
@@ -46,7 +53,9 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// One JSONL record in a Command Code v3 transcript.
 ///
 /// Only the fields this parser needs are modeled; everything else
-/// (`parentId`, `meta`, `effort`, …) is ignored by serde.
+/// (`parentId`, `meta`, `effort`, …) is ignored by serde. The top-level
+/// `role`/`content` fields exist for legacy flat-schema transcripts (see
+/// `parse_commandcode_file`).
 #[derive(Debug, Deserialize)]
 struct CommandCodeEntry {
     #[serde(rename = "type")]
@@ -59,6 +68,9 @@ struct CommandCodeEntry {
     usage: Option<CommandCodeUsage>,
     /// The model in effect for this record (message or model_change).
     model: Option<String>,
+    /// Legacy flat-schema fields: `{"role":..., "content":..., "sessionId":...}`.
+    role: Option<String>,
+    content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,12 +95,45 @@ struct CommandCodeUsage {
 }
 
 impl CommandCodeUsage {
+    /// Token breakdown with every field clamped at zero.
+    ///
+    /// Command Code's `inputTokens` is CACHE-INCLUSIVE: it already contains
+    /// the `cacheReadTokens`/`cacheWriteTokens` buckets (verified against real
+    /// transcripts — cache is ≥90% of input on most lines, and no line has
+    /// input < cache). tokscale's `TokenBreakdown` expects non-overlapping
+    /// buckets whose `total()` sums without double-counting, so the cache
+    /// overlap is subtracted from `input`, mirroring `cline`'s
+    /// `input - cache_read - cache_write` and `zcode`'s
+    /// `normalize_zcode_input_and_output`.
     fn to_breakdown(&self) -> Option<TokenBreakdown> {
-        let input = self.input_tokens.unwrap_or(0).max(0);
-        let output = self.output_tokens.unwrap_or(0).max(0);
-        let cache_read = self.cache_read_tokens.unwrap_or(0).max(0);
-        let cache_write = self.cache_write_tokens.unwrap_or(0).max(0);
-        if input + output + cache_read + cache_write == 0 {
+        // Provider-reported values come from an untrusted transcript; clamp to
+        // a plausible ceiling so one tampered line cannot poison aggregates
+        // (and so the sum below cannot overflow). ~1e12 tokens exceeds any
+        // real session by orders of magnitude.
+        const TOKEN_CEILING: i64 = 1_000_000_000_000;
+        let raw_input = self.input_tokens.unwrap_or(0).max(0).min(TOKEN_CEILING);
+        let output = self.output_tokens.unwrap_or(0).max(0).min(TOKEN_CEILING);
+        let cache_read = self
+            .cache_read_tokens
+            .unwrap_or(0)
+            .max(0)
+            .min(TOKEN_CEILING);
+        let cache_write = self
+            .cache_write_tokens
+            .unwrap_or(0)
+            .max(0)
+            .min(TOKEN_CEILING);
+        let overlap = cache_read.saturating_add(cache_write);
+        let input = raw_input.saturating_sub(overlap.min(raw_input));
+        // Saturating sum: adversarial near-i64::MAX fields must not overflow
+        // (panic in debug, wrap in release) — same discipline as
+        // `TokenBreakdown::total`.
+        if input
+            .saturating_add(output)
+            .saturating_add(cache_read)
+            .saturating_add(cache_write)
+            == 0
+        {
             return None;
         }
         Some(TokenBreakdown {
@@ -100,11 +145,19 @@ impl CommandCodeUsage {
         })
     }
 
-    /// Authoritative cost in USD, or `None` when absent/not a positive finite
-    /// number. Negative costs are rejected (`-1` is not a real bill).
+    /// Authoritative cost in USD, or `None` when absent/non-finite/beyond a
+    /// plausible ceiling.
+    ///
+    /// An explicit `0.0` IS a reported cost (free-promo models such as
+    /// `MiniMax-M3-Free` bill nothing) and must stay provider-reported so the
+    /// pricing lane does not reprice it at the paid rate — the same convention
+    /// junie/cursor/fx pin. Negative costs are rejected (`-1` is not a real
+    /// bill); so is anything above a $1M ceiling, which no single request can
+    /// reach and which would otherwise flow verbatim into aggregates.
     fn reported_cost(&self) -> Option<f64> {
+        const COST_CEILING: f64 = 1_000_000.0;
         self.cost_usd
-            .filter(|cost| cost.is_finite() && *cost >= 0.0 && *cost > 0.0)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0 && *cost <= COST_CEILING)
     }
 }
 
@@ -129,6 +182,9 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
     let session_id_from_path = session_id_from_path(path);
     let workspace_key = workspace_key_from_path(path);
     let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+    // Hoisted out of the loop: the legacy fallback path reads the configured
+    // agent model once per file, not once per assistant line.
+    let config_model = model_from_config(path);
 
     let mut messages = Vec::new();
     let mut session_id: Option<String> = None;
@@ -138,9 +194,7 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
     // for the estimation fallback on transcripts without a `usage` block.
     let mut turn_input_chars: usize = 0;
     // Tracks whether the most recent non-assistant entry started a user turn,
-    // used to mark the first assistant response of each turn. A response that
-    // is itself the first thing in the transcript (no preceding user record)
-    // is still a turn start.
+    // used to mark the first assistant response of each turn.
     let mut pending_turn_start = false;
     let mut assistant_index = 0usize;
 
@@ -150,7 +204,10 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
             Err(_) => return,
         };
 
-        if session_id.is_none() {
+        // The session id comes from the `session` header record. A message
+        // record's `id` is a per-message UUID, not a session id — never use it
+        // as a fallback when the header is missing/corrupt.
+        if entry.record_type.as_deref() == Some("session") {
             if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
                 session_id = Some(id.to_string());
             }
@@ -167,9 +224,16 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
             // A `model_change` record updates the model in effect; nothing to
             // emit (handled above by the shared model tracking).
             Some("model_change") => {}
+            // v3 `message` records, plus legacy flat-schema lines that carry no
+            // `type` at all (`_` arm). Legacy lines put `role`/`content` at the
+            // top level; v3 nests them under `message`.
             Some("message") | _ => {
-                let Some(message) = entry.message.as_ref() else {
-                    return;
+                let message = match entry.message.as_ref() {
+                    Some(message) => message,
+                    None if entry.role.is_some() || entry.content.is_some() => {
+                        &legacy_message(&entry)
+                    }
+                    None => return,
                 };
                 let Some(role) = message.role.as_deref() else {
                     return;
@@ -180,7 +244,7 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                 if role == "assistant" {
                     // Prefer authoritative usage; fall back to estimating from
                     // the per-turn delta of message content when no usage block
-                    // is present (older transcripts).
+                    // is present (legacy transcripts).
                     let breakdown = entry
                         .usage
                         .as_ref()
@@ -199,7 +263,9 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     turn_input_chars = 0;
 
                     if breakdown.total() == 0 {
-                        pending_turn_start = false;
+                        // No message is emitted, so the next real assistant
+                        // message in this turn must keep its is_turn_start
+                        // marker — mirroring zcode's drop path.
                         return;
                     }
 
@@ -211,9 +277,9 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     // else "unknown".
                     let raw_model = match model_id {
                         Some(ref model) => model.clone(),
-                        None => {
-                            model_from_config(path).unwrap_or_else(|| UNKNOWN_MODEL.to_string())
-                        }
+                        None => config_model
+                            .clone()
+                            .unwrap_or_else(|| UNKNOWN_MODEL.to_string()),
                     };
                     let resolved_model = canonicalize_model(&raw_model);
                     // Recover the real provider from the model id (e.g.
@@ -273,14 +339,23 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
     messages
 }
 
+/// Adapt a legacy flat-schema record (`{"role":..., "content":..., ...}` with
+/// no `type`/`message` nesting) to the nested-message shape the parser shares
+/// with v3 records.
+fn legacy_message(entry: &CommandCodeEntry) -> CommandCodeMessage {
+    CommandCodeMessage {
+        role: entry.role.clone(),
+        content: entry.content.clone(),
+    }
+}
+
 /// Whether a user-role content block is a tool result (a continuation of the
 /// current turn) rather than a genuine new user prompt.
 ///
 /// Command Code delivers tool results under `role: "user"` with content blocks
 /// of `type: "tool_result"`, so a plain role check would start a new turn for
-/// every tool result. The first content block's type is decisive: a real
-/// prompt carries `type: "text"` (or a string/object form in older
-/// transcripts).
+/// every tool result. The content block's type is decisive: a real prompt
+/// carries `type: "text"` (or a string/object form in older transcripts).
 fn is_tool_result(content: &Option<serde_json::Value>) -> bool {
     match content {
         Some(serde_json::Value::Array(items)) => items
@@ -289,6 +364,10 @@ fn is_tool_result(content: &Option<serde_json::Value>) -> bool {
             .any(|block| {
                 block.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
             }),
+        // A single bare `{"type":"tool_result",...}` object (not array-wrapped).
+        Some(serde_json::Value::Object(map)) => {
+            map.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+        }
         _ => false,
     }
 }
@@ -299,11 +378,12 @@ fn is_tool_result(content: &Option<serde_json::Value>) -> bool {
 /// tool-call arguments, tool-result payloads, and numeric/boolean values — and
 /// avoids guessing which fields are structural versus content.
 ///
-/// Genuinely empty content (null, `[]`, `{}`) counts as zero so that contentless
-/// turns are not charged for their structural brackets.
+/// Genuinely empty content (null, `""`, `[]`, `{}`) counts as zero so that
+/// contentless turns are not charged for their structural brackets.
 fn content_chars(content: &serde_json::Value) -> usize {
     match content {
         serde_json::Value::Null => 0,
+        serde_json::Value::String(s) if s.is_empty() => 0,
         serde_json::Value::Array(items) if items.is_empty() => 0,
         serde_json::Value::Object(map) if map.is_empty() => 0,
         _ => serde_json::to_string(content)
@@ -358,10 +438,24 @@ fn parse_rfc3339_ms(timestamp: &str) -> Option<i64> {
 
 /// Read the configured agent model from `~/.commandcode/config.json`.
 ///
-/// `session_path` is `<root>/.commandcode/projects/<slug>/<session>.jsonl`, so
-/// the config file lives three directories up.
+/// `session_path` is normally `<root>/.commandcode/projects/<slug>/<session>.jsonl`,
+/// but the scanner walks `projects` recursively, so a transcript can sit at any
+/// depth. Count-parents guessing would land on a *different* `config.json` for
+/// nested paths (silently misattributing the model). Instead, walk up until the
+/// parent directory is named `projects` — the Command Code root is one level
+/// above it — and read `<root>/config.json` from there. Returns `None` when no
+/// ancestor named `projects` is found (so the caller's "unknown" fallback
+/// applies).
 fn model_from_config(session_path: &Path) -> Option<String> {
-    let commandcode_root = session_path.parent()?.parent()?.parent()?;
+    let mut dir = session_path.parent()?;
+    // Find the `projects` directory that anchors the Command Code root.
+    loop {
+        if dir.file_name().and_then(|name| name.to_str()) == Some("projects") {
+            break;
+        }
+        dir = dir.parent()?;
+    }
+    let commandcode_root = dir.parent()?;
     let config_path = commandcode_root.join("config.json");
     let bytes = std::fs::read(config_path).ok()?;
     let config: CommandCodeConfig = serde_json::from_slice(&bytes).ok()?;
@@ -518,8 +612,10 @@ mod tests {
         let tool_call = &messages[0];
         assert_eq!(tool_call.model_id, "deepseek-v4-flash");
         assert_eq!(tool_call.provider_id, "deepseek");
-        assert_eq!(tool_call.tokens.input, 21000);
+        // inputTokens 21000 is cache-inclusive: 17000 fresh + 4000 cache read.
+        assert_eq!(tool_call.tokens.input, 17000);
         assert_eq!(tool_call.tokens.output, 90);
+        assert_eq!(tool_call.tokens.cache_read, 4000);
         assert!((tool_call.cost - 0.002).abs() < 1e-9);
         assert!(tool_call.has_authoritative_cost());
         assert!(tool_call.is_turn_start);
@@ -531,7 +627,8 @@ mod tests {
         assert_eq!(msg.session_id, "sess-1");
         // Authoritative usage from the assistant line, not estimated from the
         // tool-result text (which is far larger than 205 output tokens).
-        assert_eq!(msg.tokens.input, 28534);
+        // 28534 inputTokens is cache-inclusive: 21110 fresh + 7424 cache read.
+        assert_eq!(msg.tokens.input, 21110);
         assert_eq!(msg.tokens.output, 205);
         assert_eq!(msg.tokens.cache_read, 7424);
         assert!((msg.cost - 0.006464748).abs() < 1e-9);
@@ -569,13 +666,17 @@ mod tests {
         assert_eq!(msg.provider_id, "deepseek");
         assert_eq!(msg.model_id, "deepseek-v4-flash");
         assert_eq!(msg.session_id, "sess-1");
-        // Authoritative counts, not estimates.
-        assert_eq!(msg.tokens.input, 28534);
+        // Authoritative counts, not estimates. `inputTokens` is cache-inclusive
+        // (28534 = 21110 fresh + 7424 cache read), so `input` is the fresh
+        // remainder, exactly like cline/zcode normalize.
+        assert_eq!(msg.tokens.input, 21110);
         assert_eq!(msg.tokens.output, 205);
         assert_eq!(msg.tokens.cache_read, 7424);
         assert_eq!(msg.tokens.cache_write, 0);
         assert_eq!(msg.tokens.reasoning, 0);
-        // Authoritative cost is embedded and marked provider-reported.
+        // Non-overlapping buckets: total() must not double-count the cache.
+        assert_eq!(msg.tokens.total(), 28739); // 21110 + 205 + 7424
+                                               // Authoritative cost is embedded and marked provider-reported.
         assert!((msg.cost - 0.006464748).abs() < 1e-9);
         assert!(msg.has_authoritative_cost());
         assert!(msg.is_turn_start);
@@ -734,5 +835,233 @@ mod tests {
         assert_eq!(msg.cost, 0.0);
         assert!(!msg.has_authoritative_cost());
         assert!(msg.is_turn_start);
+    }
+
+    /// An explicit `costUsd: 0` is a real reported cost (free-promo models bill
+    /// nothing) and must stay provider-reported — otherwise the pricing lane
+    /// reprices the call at the paid rate. Mirrors the junie/cursor/fx
+    /// convention.
+    #[test]
+    fn test_explicit_zero_cost_is_provider_reported() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "minimax/minimax-m3-free");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 10,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "costUsd": 0
+                },
+                "model": "minimax/minimax-m3-free"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.cost, 0.0);
+        assert!(
+            msg.has_authoritative_cost(),
+            "an explicit zero cost is provider-reported, not repriced"
+        );
+        // The free-promo model still canonicalizes (org + suffix stripped).
+        assert_eq!(msg.model_id, "minimax-m3");
+    }
+
+    /// `inputTokens` is cache-inclusive, so the breakdown must subtract the
+    /// cache buckets from input — otherwise `total()` double-counts cache.
+    #[test]
+    fn test_usage_input_is_cache_inclusive() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
+                "usage": {
+                    "inputTokens": 1000,
+                    "outputTokens": 50,
+                    "cacheReadTokens": 900,
+                    "cacheWriteTokens": 10,
+                    "costUsd": 0.01
+                },
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        // 1000 inputTokens = 90 fresh + 900 cache read + 10 cache write.
+        assert_eq!(msg.tokens.input, 90);
+        assert_eq!(msg.tokens.cache_read, 900);
+        assert_eq!(msg.tokens.cache_write, 10);
+        // Non-overlapping: total() is fresh + output + both caches, no double count.
+        assert_eq!(msg.tokens.total(), 1050);
+    }
+
+    /// A dropped zero-total assistant line must not consume the turn-start
+    /// marker: the next real assistant response in the same turn keeps
+    /// `is_turn_start`, mirroring zcode's drop path.
+    #[test]
+    fn test_turn_start_survives_dropped_zero_assistant_line() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // The first assistant line has NO preceding context and empty content,
+        // so estimation yields 0 tokens and it is dropped. Its turn-start
+        // marker must survive for the next response in the same turn.
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            json!({
+                "type": "message",
+                "id": "a0",
+                "timestamp": "2026-08-31T00:00:01Z",
+                "message": {"role": "assistant", "content": []}
+            }),
+            user_line("u1", "2026-08-31T00:00:02Z", "hi"),
+            assistant_line(
+                "a1",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "response",
+                10,
+                5,
+                0,
+                0.0
+            ),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        // The zero-total assistant line was dropped; the surviving response
+        // belongs to the turn started by u1 and must be marked as its start.
+        assert!(messages[0].is_turn_start);
+    }
+
+    /// Legacy flat-schema transcripts (`{"role":..., "content":...}` with no
+    /// `type`/`message` nesting) still parse via estimation.
+    #[test]
+    fn test_legacy_flat_schema_still_parses_with_estimation() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "MiniMaxAI/MiniMax-M3-Free");
+        let jsonl = concat!(
+            r#"{"role":"user","sessionId":"sess-1","content":[{"type":"text","text":"12345678"}]}"#,
+            "\n",
+            r#"{"role":"assistant","sessionId":"sess-1","content":[{"type":"text","text":"abcd"}]}"#,
+        );
+        let path = write_session(&dir, "proj", "sess-1", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.client, "commandcode");
+        assert_eq!(msg.model_id, "MiniMax-M3");
+        assert_eq!(msg.provider_id, "minimax");
+        assert_eq!(msg.session_id, "sess-1");
+        assert_eq!(
+            msg.tokens.input,
+            estimate_tokens(content_chars(
+                &json!([{"type": "text", "text": "12345678"}])
+            ))
+        );
+        assert_eq!(
+            msg.tokens.output,
+            estimate_tokens(content_chars(&json!([{"type": "text", "text": "abcd"}])))
+        );
+        assert!(!msg.has_authoritative_cost());
+    }
+
+    /// An empty `usage` block on an assistant line falls back to estimation.
+    #[test]
+    fn test_empty_usage_block_falls_back_to_estimation() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "2026-08-31T00:00:00Z", "12345678"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "abcd"}]},
+                "usage": {},
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(
+            msg.tokens.input,
+            estimate_tokens(content_chars(
+                &json!([{"type": "text", "text": "12345678"}])
+            ))
+        );
+        assert_eq!(
+            msg.tokens.output,
+            estimate_tokens(content_chars(&json!([{"type": "text", "text": "abcd"}])))
+        );
+        assert!(!msg.has_authoritative_cost());
+    }
+
+    /// Adversarial near-i64::MAX token fields and an absurd cost are clamped to
+    /// sane ceilings instead of overflowing or poisoning aggregates.
+    #[test]
+    fn test_adversarial_usage_values_are_clamped() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
+                "usage": {
+                    "inputTokens": 9223372036854775807i64,
+                    "outputTokens": 9223372036854775807i64,
+                    "cacheReadTokens": 9223372036854775807i64,
+                    "cacheWriteTokens": 9223372036854775807i64,
+                    "costUsd": 1.0e300
+                },
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        // Clamped to the ceiling; no overflow, no i64::MAX poisoning.
+        assert_eq!(msg.tokens.input, 0); // 1e12 - (1e12 + 1e12) clamped to 0
+        assert_eq!(msg.tokens.output, 1_000_000_000_000);
+        assert_eq!(msg.tokens.cache_read, 1_000_000_000_000);
+        assert_eq!(msg.tokens.total(), 3_000_000_000_000);
+        // Absurd cost rejected: not provider-reported, so pricing applies.
+        assert_eq!(msg.cost, 0.0);
+        assert!(!msg.has_authoritative_cost());
     }
 }
