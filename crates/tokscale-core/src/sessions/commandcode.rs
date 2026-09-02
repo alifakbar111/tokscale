@@ -121,27 +121,42 @@ impl CommandCodeUsage {
     /// exact recorded value; subtracting cache from input yields 0.004831468,
     /// which does not). So the buckets are passed through verbatim, and
     /// `total()` sums them without double-counting.
+    ///
+    /// Returns `None` ONLY when the block reports no counts at all (every
+    /// bucket field absent) — the caller's signal that it may estimate. An
+    /// all-zero block, where every bucket is present and `0`, is a reported
+    /// zero and must NOT be confused with an absent one: Command Code seeds
+    /// its accumulator with `{inputTokens:0, outputTokens:0,
+    /// cacheReadTokens:0, cacheWriteTokens:0}` and its finish handler writes
+    /// `?? 0` for every field, so all-zero is exactly what the transcript
+    /// records when the provider reported nothing back. Conflating the two
+    /// made the caller estimate tokens out of the message text while
+    /// `reported_cost()` independently returned `Some(0.0)` on the same line —
+    /// invented token counts stamped provider-reported at $0.00, immune to
+    /// repricing and marking the day's cost complete. Reporting the zero
+    /// verbatim lets the caller drop the message instead, which is what the
+    /// vendor's own accounting does (adding 0 to each bucket is a no-op).
     fn to_breakdown(&self) -> Option<TokenBreakdown> {
+        // "No counts reported" is the only case the caller may estimate from.
+        // At least one bucket field present means the numbers below are the
+        // provider's, zeros included.
+        let any_bucket_reported = self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_read_tokens.is_some()
+            || self.cache_write_tokens.is_some();
+        if !any_bucket_reported {
+            return None;
+        }
         // Provider-reported values come from an untrusted transcript; clamp to
         // a plausible ceiling so one tampered line cannot poison aggregates
-        // (and so the sum below cannot overflow). ~1e12 tokens exceeds any
-        // real session by orders of magnitude.
+        // (and so downstream sums cannot overflow). ~1e12 tokens exceeds any
+        // real session by orders of magnitude, and four clamped buckets still
+        // sum well inside i64.
         const TOKEN_CEILING: i64 = 1_000_000_000_000;
         let input = self.input_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let output = self.output_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let cache_read = self.cache_read_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let cache_write = self.cache_write_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
-        // Saturating sum: adversarial near-i64::MAX fields must not overflow
-        // (panic in debug, wrap in release) — same discipline as
-        // `TokenBreakdown::total`.
-        if input
-            .saturating_add(output)
-            .saturating_add(cache_read)
-            .saturating_add(cache_write)
-            == 0
-        {
-            return None;
-        }
         Some(TokenBreakdown {
             input,
             output,
@@ -249,7 +264,18 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
         // the scan. Every entry with an id participates; the last entry seen
         // (by file order) is the current leaf.
         if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
-            parent_map.insert(id.to_string(), entry.parent_id.clone());
+            // An empty-string `parentId` means the same thing as JSON `null`:
+            // this entry is a root. Normalizing it here is load-bearing — the
+            // walk below distinguishes "reached a root" (stop, filter) from
+            // "named ancestor missing" (broken chain, do not filter), and an
+            // un-normalized `""` would take the broken-chain arm and disable
+            // the abandoned-branch filter for the whole file.
+            let parent = entry
+                .parent_id
+                .as_deref()
+                .filter(|parent| !parent.is_empty())
+                .map(str::to_string);
+            parent_map.insert(id.to_string(), parent);
             last_entry_id = Some(id.to_string());
         }
 
@@ -277,8 +303,11 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
 
                 if role == "assistant" {
                     // Prefer authoritative usage; fall back to estimating from
-                    // the per-turn delta of message content when no usage block
-                    // is present (legacy transcripts).
+                    // the per-turn delta of message content ONLY when no counts
+                    // were reported at all (legacy transcripts, or a `usage`
+                    // block carrying no bucket fields). A reported all-zero
+                    // block is authoritative and must never be estimated over
+                    // — see `to_breakdown`.
                     let breakdown = entry
                         .usage
                         .as_ref()
@@ -297,6 +326,14 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     turn_input_chars = 0;
 
                     if breakdown.total() == 0 {
+                        // Nothing was used, so nothing is billed. This drop is
+                        // load-bearing for reported zeros: it returns BEFORE
+                        // `reported_cost()` below, so an all-zero turn cannot
+                        // emit a $0.00 provider-reported row (which would mark
+                        // the day's cost complete on a message that records no
+                        // usage). It matches the vendor's accounting, where
+                        // adding a zero bucket and a zero cost are both no-ops.
+                        //
                         // No message is emitted, so the next real assistant
                         // message in this turn must keep its is_turn_start
                         // marker — mirroring zcode's drop path.
@@ -423,8 +460,25 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
 
 /// The set of entry ids on the active branch of a transcript tree: the parent
 /// chain starting at `last_entry_id` walking `parent_id` links, including the
-/// leaf itself. Returns `None` when `last_entry_id` is absent (no tree — a
-/// legacy flat-schema transcript), in which case the caller keeps everything.
+/// leaf itself.
+///
+/// Returns `None` when the branch cannot be reconstructed, in which case the
+/// caller keeps every message rather than filtering against a partial chain:
+///
+/// * `last_entry_id` is absent — no tree at all (a legacy flat-schema
+///   transcript).
+/// * The chain names an ancestor this file does not contain. That happens
+///   whenever a line between the leaf and the root was skipped: one
+///   unparseable line (a lossy-UTF-8 byte, a partially-flushed append from a
+///   crash, a field whose type drifted between vendor versions) removes its
+///   `id` from the map, and the walk hits the hole. Filtering on the truncated
+///   chain would silently discard every turn recorded BEFORE that line —
+///   arbitrarily much real, already-billed usage — so the filter is refused
+///   instead. This deliberately diverges from the vendor's `buildSessionPath`,
+///   which truncates at the same hole: truncation is cosmetic when rendering a
+///   conversation and is lost money when accounting for one. The cost of
+///   failing open is re-counting an abandoned `/rewind` branch in that one
+///   file, which is bounded; the cost of failing closed is not.
 ///
 /// The walk is bounded by the number of entries in the map so a malformed
 /// (cyclic) `parentId` chain cannot loop forever.
@@ -441,7 +495,12 @@ fn active_branch_ids(
         }
         match parent_map.get(&current) {
             Some(Some(parent)) => current = parent.clone(),
-            Some(None) | None => return Some(branch),
+            // A real root (`parentId` null or empty, normalized at insertion).
+            // The chain is complete, so the branch is trustworthy.
+            Some(None) => return Some(branch),
+            // The named ancestor is not in this file: the chain is broken and
+            // everything past the hole is unreachable from the leaf.
+            None => return None,
         }
     }
 }
@@ -755,6 +814,9 @@ mod tests {
         write_config(&dir, "model-x");
         // The active branch is: u1 -> a2 (the last entry). a1 is an orphaned
         // assistant response from a `/rewind` — its usage must not count.
+        // u1's `parentId` is `""`, the empty-string form of a root; the walk
+        // must terminate there through the ROOT arm, not through the
+        // broken-chain arm (which would refuse to filter and keep a1).
         let jsonl = format!(
             "{}\n{}\n{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
@@ -794,6 +856,121 @@ mod tests {
         assert_eq!(msg.tokens.cache_read, 2000);
         assert!((msg.cost - 0.02).abs() < 1e-9);
         assert!(msg.is_turn_start);
+    }
+
+    /// One unparseable line must cost that line, not the file's history.
+    ///
+    /// Regression guard. A skipped line's `id` never enters the parent map, so
+    /// the branch walk from the leaf hits a hole. The walk used to treat a
+    /// missing ancestor exactly like a root — returning a chain truncated at
+    /// the hole — and the retain filter then dropped every turn recorded
+    /// BEFORE the bad line. On a long session that is almost the whole file:
+    /// real, already-billed usage deleted because of one damaged byte.
+    #[test]
+    fn test_unparseable_midfile_line_does_not_discard_earlier_turns() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // Line 4 is a truncated append (a crash mid-write, or one undecodable
+        // byte that `String::from_utf8_lossy` turned into U+FFFD). It would
+        // have been `u2`, which `a2` names as its parent.
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "first prompt"),
+            assistant_line(
+                "a1",
+                "u1",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "first answer",
+                1000,
+                100,
+                0,
+                0.01
+            ),
+            r#"{"type":"message","id":"u2","parentId":"a1","timestamp":"2026-08-3"#,
+            assistant_line(
+                "a2",
+                "u2",
+                "2026-08-31T00:00:15Z",
+                "model-x",
+                "second answer",
+                2000,
+                200,
+                0,
+                0.02
+            ),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(
+            messages.len(),
+            2,
+            "the turn before the damaged line must survive it"
+        );
+        assert_eq!(
+            messages.iter().map(|m| m.tokens.input).sum::<i64>(),
+            3000,
+            "both turns' authoritative input tokens must be kept"
+        );
+        assert!(
+            (messages.iter().map(|m| m.cost).sum::<f64>() - 0.03).abs() < 1e-9,
+            "both turns' authoritative cost must be kept"
+        );
+    }
+
+    /// Refusing to filter on a BROKEN chain must not become refusing to filter
+    /// at all: when the chain reaches a genuine `parentId: null` root, the
+    /// abandoned `/rewind` branch is still dropped.
+    #[test]
+    fn test_null_root_chain_still_drops_abandoned_branch() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            json!({
+                "type": "message",
+                "id": "u1",
+                "parentId": null,
+                "timestamp": "2026-08-31T00:00:00Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "original"}]}
+            }),
+            assistant_line(
+                "a1",
+                "u1",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "abandoned by /rewind",
+                5000,
+                200,
+                1000,
+                0.01
+            ),
+            user_line("u2", "u1", "2026-08-31T00:00:10Z", "actually, redo it"),
+            assistant_line(
+                "a2",
+                "u2",
+                "2026-08-31T00:00:15Z",
+                "model-x",
+                "the real final answer",
+                6000,
+                300,
+                2000,
+                0.02
+            ),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(
+            messages.len(),
+            1,
+            "a complete chain to a null root must still drop the abandoned branch"
+        );
+        assert_eq!(messages[0].tokens.input, 6000);
+        assert!((messages[0].cost - 0.02).abs() < 1e-9);
     }
 
     /// A `/fork` copies entries (same `id` + `timestamp`) into a new session
@@ -1236,6 +1413,170 @@ mod tests {
         assert_eq!(msg.tokens.cache_write, 10);
         // total() is the sum of all buckets, no double-count and no subtraction.
         assert_eq!(msg.tokens.total(), 1960);
+    }
+
+    /// An all-zero `usage` block is a REPORTED zero, not an absent one:
+    /// Command Code seeds its accumulator with all four buckets at `0` and its
+    /// finish handler writes `?? 0` for every field, so this is exactly what a
+    /// transcript records when the provider reported nothing back — and the
+    /// same line carries `costUsd: 0`.
+    ///
+    /// Regression guard. The parser used to read an all-zero block as "no
+    /// usage", estimate ~1000 tokens out of the message text, and then stamp
+    /// those invented tokens provider-reported at $0.00 (because
+    /// `reported_cost()` accepts an explicit zero, independently of the
+    /// buckets). Numbers nobody measured, published as authoritative, immune
+    /// to repricing, and marking the day's cost complete.
+    #[test]
+    fn test_all_zero_usage_block_is_not_estimated_or_marked_provider_reported() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // Long enough that the old estimation fallback produced a four-digit
+        // token count — the fabricated number this guards against.
+        let long_prompt = "x".repeat(4000);
+        let long_answer = "y".repeat(4000);
+        let zero_usage_line = |cost: serde_json::Value| {
+            json!({
+                "type": "message",
+                "id": "a1",
+                "parentId": "u1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": long_answer}]},
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "costUsd": cost
+                },
+                "model": "model-x"
+            })
+            .to_string()
+        };
+
+        // The dangerous shape: all four buckets zero AND an explicit zero cost.
+        let with_zero_cost = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", &long_prompt),
+            zero_usage_line(json!(0)),
+        );
+        let path = write_session(&dir, "proj", "zero-cost", &with_zero_cost);
+        let messages = parse_commandcode_file(&path);
+        assert!(
+            messages.is_empty(),
+            "a reported all-zero turn must emit nothing, not estimated tokens; got {:?}",
+            messages
+                .iter()
+                .map(|m| (m.tokens.total(), m.cost, m.has_authoritative_cost()))
+                .collect::<Vec<_>>()
+        );
+
+        // Same block with no `costUsd` at all: still authoritative zeros, so
+        // the drop must not depend on a cost being present.
+        let without_cost = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", &long_prompt),
+            zero_usage_line(serde_json::Value::Null),
+        );
+        let path = write_session(&dir, "proj", "no-cost", &without_cost);
+        let messages = parse_commandcode_file(&path);
+        assert!(
+            messages.is_empty(),
+            "an all-zero block without costUsd is still authoritative; got {:?}",
+            messages
+                .iter()
+                .map(|m| (m.tokens.total(), m.cost))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A `usage` block that reports only some buckets is still authoritative:
+    /// the absent ones are zero, not an invitation to estimate. Pins that the
+    /// "may estimate" rule keys on *no bucket field at all*, not on *every*
+    /// bucket field being present.
+    #[test]
+    fn test_partial_usage_block_is_authoritative_not_estimated() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", &"p".repeat(4000)),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "parentId": "u1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "short"}]},
+                "usage": {"outputTokens": 7, "costUsd": 0.25},
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        // Absent buckets are reported zeros; the 4000-char prompt must NOT be
+        // estimated into `input`.
+        assert_eq!(msg.tokens.input, 0);
+        assert_eq!(msg.tokens.output, 7);
+        assert_eq!(msg.tokens.cache_read, 0);
+        assert_eq!(msg.tokens.cache_write, 0);
+        assert!((msg.cost - 0.25).abs() < 1e-9);
+        assert!(msg.has_authoritative_cost());
+    }
+
+    /// A dropped all-zero *authoritative* line must not consume the turn-start
+    /// marker either — the next real response in the same turn keeps it.
+    #[test]
+    fn test_turn_start_survives_dropped_all_zero_authoritative_line() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hi"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "parentId": "u1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "aborted"}]},
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "costUsd": 0
+                },
+                "model": "model-x"
+            }),
+            assistant_line(
+                "a2",
+                "a1",
+                "2026-08-31T00:00:09Z",
+                "model-x",
+                "the real response",
+                10,
+                5,
+                0,
+                0.001
+            ),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1, "the all-zero line must not be emitted");
+        let msg = &messages[0];
+        assert_eq!(msg.tokens.input, 10);
+        assert_eq!(msg.tokens.output, 5);
+        assert!(
+            msg.is_turn_start,
+            "the turn started by u1 must be marked on the surviving response"
+        );
     }
 
     /// A dropped zero-total assistant line must not consume the turn-start
