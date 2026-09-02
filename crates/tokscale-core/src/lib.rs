@@ -4743,15 +4743,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Augment, augment_count);
     messages.extend(augment_msgs);
 
-    let commandcode_msgs: Vec<ParsedMessage> = scan_result
+    // Message-level dedup collapses the `/fork`/`/clone` copies that
+    // Command Code writes as duplicate entries across separate transcript
+    // files. The cached pricing lane above already does this; without the
+    // same filter here, local `tokscale` output double-counts a forked
+    // session while `submit` does not, and the two disagree on the same
+    // machine. Mirrors the augment lane above and the gjc lane below.
+    let commandcode_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
-        .flat_map(|path| {
-            sessions::commandcode::parse_commandcode_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::commandcode::parse_commandcode_file(path))
+        .collect();
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
+    let commandcode_msgs: Vec<ParsedMessage> = commandcode_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message))
+        .map(|msg| unified_to_parsed(&msg))
         .collect();
     let commandcode_count = commandcode_msgs.len() as i32;
     counts.set(ClientId::CommandCode, commandcode_count);
@@ -10068,6 +10075,100 @@ mod tests {
                     .map(|message| message.output)
                     .sum::<i64>(),
                 33
+            );
+        }
+    }
+
+    /// `/fork` copies the transcript into a new session file, so the same
+    /// assistant entry lands on disk twice. The pricing lane collapses that
+    /// with `should_keep_deduped_message`; this asserts the local lane does
+    /// too, end to end through `parse_local_clients`.
+    ///
+    /// The parser's own `test_fork_copies_share_dedup_key` cannot catch this:
+    /// it re-implements the dedup filter inline instead of exercising the
+    /// caller, so it stayed green while the caller had no filter at all.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_commandcode_counts_deduplicated_forked_history() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+
+        {
+            let projects_dir = client_scan_root(source_home.path(), ClientId::CommandCode);
+            std::fs::create_dir_all(projects_dir.join("proj")).unwrap();
+            let root_dir = projects_dir.parent().unwrap();
+            std::fs::write(
+                root_dir.join("config.json"),
+                r#"{"provider":"command-code","model":"model-x"}"#,
+            )
+            .unwrap();
+
+            // One assistant entry (`a1` at a fixed timestamp), written twice:
+            // once in the original session and once in the fork, where an
+            // extra user turn shifts its position in the file.
+            let assistant = concat!(
+                r#"{"type":"message","id":"a1","parentId":"PARENT","timestamp":"2026-08-31T00:00:05Z","#,
+                r#""message":{"role":"assistant","content":[{"type":"text","text":"answer"}]},"#,
+                r#""usage":{"inputTokens":100,"outputTokens":10,"cacheReadTokens":5,"cacheWriteTokens":0,"costUsd":0.001},"#,
+                r#""model":"model-x"}"#
+            );
+            let original = format!(
+                "{}\n{}\n{}\n",
+                r#"{"type":"session","version":3,"id":"orig-sess"}"#,
+                r#"{"type":"message","id":"u1","parentId":"","timestamp":"2026-08-31T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}"#,
+                assistant.replace("PARENT", "u1"),
+            );
+            let fork = format!(
+                "{}\n{}\n{}\n{}\n",
+                r#"{"type":"session","version":3,"id":"fork-sess"}"#,
+                r#"{"type":"message","id":"u1","parentId":"","timestamp":"2026-08-31T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"prompt"}]}}"#,
+                r#"{"type":"message","id":"u2","parentId":"u1","timestamp":"2026-08-31T00:00:02Z","message":{"role":"user","content":[{"type":"text","text":"extra turn"}]}}"#,
+                assistant.replace("PARENT", "u2"),
+            );
+            std::fs::write(projects_dir.join("proj").join("orig.jsonl"), original).unwrap();
+            std::fs::write(projects_dir.join("proj").join("fork.jsonl"), fork).unwrap();
+
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["commandcode".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+
+            assert_eq!(
+                parsed.counts.get(ClientId::CommandCode),
+                1,
+                "the forked copy of `a1` must not be counted a second time",
+            );
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.input)
+                    .sum::<i64>(),
+                100,
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.output)
+                    .sum::<i64>(),
+                10,
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.cache_read)
+                    .sum::<i64>(),
+                5,
             );
         }
     }
