@@ -19,12 +19,22 @@
 //! text), the v3 transcript DOES persist per-request usage and cost. When a
 //! message line carries a `usage` block, its token counts and `costUsd` are
 //! used verbatim and marked provider-reported, so the cost is not overwritten
-//! by tokscale's estimated pricing. `inputTokens` is CACHE-INCLUSIVE (it
-//! already contains the `cacheReadTokens`/`cacheWriteTokens` buckets), so the
-//! cache overlap is subtracted from the input bucket — the same
-//! cache-inclusive normalization cline and zcode apply. Lines without `usage`
-//! (user turns, tool results) contribute nothing themselves — the assistant
-//! turn that follows them carries the full request accounting.
+//! by tokscale's estimated pricing. The usage buckets are DISJOINT:
+//! `inputTokens` is cache-exclusive and `cacheReadTokens`/`cacheWriteTokens`
+//! are billed on top of it — the vendor's own cost arithmetic reproduces the
+//! recorded `costUsd` exactly only when the full `inputTokens` is charged at
+//! the input rate plus the cache buckets, so no subtraction is applied. Lines
+//! without `usage` (user turns, tool results) contribute nothing themselves —
+//! the assistant turn that follows them carries the full request accounting.
+//!
+//! The transcript is a TREE, not a log: `/rewind` moves the leaf pointer
+//! backwards and `persistEntry` is append-only, so orphaned assistant entries
+//! keep their `usage` on disk but are NOT on the active branch. The vendor
+//! counts only `getBranch()` (the parent chain from the last entry), and this
+//! parser matches that by dropping messages whose entry id is not on the
+//! active branch. `/fork`/`/clone` copies entries into a new session file
+//! leaving the original; the per-entry `id` + `timestamp` dedup key collapses
+//! those copies across files.
 //!
 //! Legacy flat-schema transcripts (`{"role":..., "content":..., ...}` with no
 //! `type`/`message` nesting) are still parsed via the ~4 chars/token estimation
@@ -33,9 +43,10 @@
 //! The model id is read from the line's own `model` field, falling back to the
 //! most recent `model_change` event, then to `~/.commandcode/config.json` (the
 //! configured agent model), then to "unknown". Gateway ids such as
-//! `MiniMaxAI/MiniMax-M3-Free` are canonicalized by dropping the org prefix and
-//! the `-Free` promo suffix so pricing resolves to the real model key, and the
-//! provider hint carried in the id (e.g. `minimax`) is recovered the same way.
+//! `MiniMaxAI/MiniMax-M3-Free` have their org prefix dropped for pricing
+//! (the provider hint is recovered from the RAW id before stripping), but the
+//! `-Free` suffix is preserved — `poolside/laguna-s-2.1-free` is a real
+//! catalog id, so stripping it would invent a nonexistent model.
 
 use super::utils::{
     estimate_tokens, file_modified_timestamp_ms, for_each_json_line, session_id_from_path,
@@ -61,6 +72,8 @@ struct CommandCodeEntry {
     #[serde(rename = "type")]
     record_type: Option<String>,
     id: Option<String>,
+    #[serde(rename = "parentId")]
+    parent_id: Option<String>,
     timestamp: Option<String>,
     /// The conversation entry, present on `type == "message"` records.
     message: Option<CommandCodeMessage>,
@@ -97,26 +110,25 @@ struct CommandCodeUsage {
 impl CommandCodeUsage {
     /// Token breakdown with every field clamped at zero.
     ///
-    /// Command Code's `inputTokens` is CACHE-INCLUSIVE: it already contains
-    /// the `cacheReadTokens`/`cacheWriteTokens` buckets (verified against real
-    /// transcripts — cache is ≥90% of input on most lines, and no line has
-    /// input < cache). tokscale's `TokenBreakdown` expects non-overlapping
-    /// buckets whose `total()` sums without double-counting, so the cache
-    /// overlap is subtracted from `input`, mirroring `cline`'s
-    /// `input - cache_read - cache_write` and `zcode`'s
-    /// `normalize_zcode_input_and_output`.
+    /// Command Code's buckets are DISJOINT: `inputTokens` is cache-exclusive
+    /// and `cacheReadTokens`/`cacheWriteTokens` are billed on top of it. The
+    /// vendor's own cost function charges the full `inputTokens` at the input
+    /// rate plus the cache buckets, and that arithmetic reproduces the
+    /// transcript's recorded `costUsd` exactly (verified: input 28534, output
+    /// 205, cacheRead 7424 at deepseek-v4-flash rates yields 0.006464748, the
+    /// exact recorded value; subtracting cache from input yields 0.004831468,
+    /// which does not). So the buckets are passed through verbatim, and
+    /// `total()` sums them without double-counting.
     fn to_breakdown(&self) -> Option<TokenBreakdown> {
         // Provider-reported values come from an untrusted transcript; clamp to
         // a plausible ceiling so one tampered line cannot poison aggregates
         // (and so the sum below cannot overflow). ~1e12 tokens exceeds any
         // real session by orders of magnitude.
         const TOKEN_CEILING: i64 = 1_000_000_000_000;
-        let raw_input = self.input_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
+        let input = self.input_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let output = self.output_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let cache_read = self.cache_read_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
         let cache_write = self.cache_write_tokens.unwrap_or(0).clamp(0, TOKEN_CEILING);
-        let overlap = cache_read.saturating_add(cache_write);
-        let input = raw_input.saturating_sub(overlap.min(raw_input));
         // Saturating sum: adversarial near-i64::MAX fields must not overflow
         // (panic in debug, wrap in release) — same discipline as
         // `TokenBreakdown::total`.
@@ -189,6 +201,19 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
     // used to mark the first assistant response of each turn.
     let mut pending_turn_start = false;
     let mut assistant_index = 0usize;
+    // The v3 transcript is a tree, not a log: `/rewind` moves the leaf pointer
+    // backwards and `persistEntry` is append-only, so orphaned assistant
+    // entries keep their `usage` on disk but are NOT on the active branch. The
+    // vendor's own stats iterate `getBranch()` (the parent chain from the last
+    // entry) and never count them, so the parser must too. Track every message
+    // record's `id -> parentId` plus the last entry's id; after the scan,
+    // retain only messages whose entry id sits on that branch. Parallel to
+    // `messages`: each emitted message's entry id (None for legacy flat-schema
+    // lines, which have no tree and are always kept).
+    let mut message_entry_ids: Vec<Option<String>> = Vec::new();
+    let mut parent_map: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut last_entry_id: Option<String> = None;
 
     for_each_json_line(path, &mut |_index, trimmed| {
         let entry = match serde_json::from_str::<CommandCodeEntry>(trimmed) {
@@ -210,6 +235,14 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
         // effect for that call.
         if let Some(model) = entry.model.as_deref().filter(|model| !model.is_empty()) {
             model_id = Some(model.to_string());
+        }
+
+        // Record the tree edge so the active branch can be reconstructed after
+        // the scan. Every entry with an id participates; the last entry seen
+        // (by file order) is the current leaf.
+        if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
+            parent_map.insert(id.to_string(), entry.parent_id.clone());
+            last_entry_id = Some(id.to_string());
         }
 
         match entry.record_type.as_deref() {
@@ -275,15 +308,16 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                             .unwrap_or_else(|| UNKNOWN_MODEL.to_string()),
                     };
                     let resolved_model = canonicalize_model(&raw_model);
-                    // Recover the real provider from the model id (e.g.
-                    // `MiniMaxAI/MiniMax-M3-Free` -> `minimax`) so pricing
-                    // resolves to that provider's catalog. The client's own
-                    // `command-code` provider is not a pricing provider, so
-                    // without this a MiniMax model would never reach a
-                    // `minimax/...` key. Falls back to `command-code` when
-                    // nothing is inferred.
-                    let provider_id =
-                        provider_hint_for_model(&resolved_model).unwrap_or(PROVIDER_ID);
+                    // Recover the real provider from the RAW model id (e.g.
+                    // `Meta/Meta-Muse-Spark-1.1` -> `meta`) so pricing resolves
+                    // to that provider's catalog. The hint must come from the
+                    // full gateway id BEFORE org-stripping: `canonicalize_model`
+                    // drops the org segment, and several catalog ids carry their
+                    // provider only in that segment (e.g. `meta/muse-spark-1.1`),
+                    // so deriving the hint from the canonicalized model loses it.
+                    // The client's own `command-code` provider is not a pricing
+                    // provider; falls back to it when nothing is inferred.
+                    let provider_id = provider_hint_for_model(&raw_model).unwrap_or(PROVIDER_ID);
                     let timestamp = entry
                         .timestamp
                         .as_deref()
@@ -291,6 +325,21 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                         .unwrap_or(fallback_timestamp);
 
                     let cost = entry.usage.as_ref().and_then(|u| u.reported_cost());
+                    // Dedup key. A `/fork`/`/clone` copies entries — with their
+                    // per-entry `id` and `timestamp` preserved — into a new
+                    // session file and leaves the original, so keying on the
+                    // entry id + timestamp collapses the copies across files.
+                    // The vendor's entry id is `randomUUID().slice(0,8)` (32
+                    // bits, unique only within one session), so a bare id is
+                    // NOT a safe global key — combining it with the timestamp
+                    // makes a collision across genuinely distinct entries
+                    // effectively impossible while still matching a fork copy
+                    // byte-for-byte. Legacy flat-schema lines carry no entry id
+                    // and fall back to the positional key.
+                    let dedup_key = entry
+                        .id
+                        .as_deref()
+                        .map(|id| format!("{}:{}:{}", id, timestamp, assistant_index));
                     let mut message = UnifiedMessage::new_with_dedup(
                         CLIENT_ID,
                         resolved_model,
@@ -299,7 +348,8 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                         timestamp,
                         breakdown,
                         cost.unwrap_or(0.0),
-                        Some(format!("{}:{}", resolved_session, assistant_index)),
+                        dedup_key
+                            .or_else(|| Some(format!("{}:{}", resolved_session, assistant_index))),
                     );
                     message.message_count = 1;
                     message.is_turn_start = pending_turn_start;
@@ -307,6 +357,7 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     if cost.is_some() {
                         message.mark_provider_reported_cost();
                     }
+                    message_entry_ids.push(entry.id.clone());
                     messages.push(message);
 
                     assistant_index += 1;
@@ -329,7 +380,46 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
         }
     });
 
-    messages
+    // Reconstruct the active branch from the last entry's parent chain and drop
+    // messages whose entry id is not on it (abandoned `/rewind` branches). A
+    // cycle guard bounds the walk; legacy flat-schema messages (None entry id)
+    // are always kept.
+    if let Some(branch) = active_branch_ids(&parent_map, last_entry_id.as_deref()) {
+        let mut kept = Vec::with_capacity(messages.len());
+        for (message, entry_id) in messages.into_iter().zip(message_entry_ids) {
+            if entry_id.as_deref().is_none_or(|id| branch.contains(id)) {
+                kept.push(message);
+            }
+        }
+        kept
+    } else {
+        messages
+    }
+}
+
+/// The set of entry ids on the active branch of a transcript tree: the parent
+/// chain starting at `last_entry_id` walking `parent_id` links, including the
+/// leaf itself. Returns `None` when `last_entry_id` is absent (no tree — a
+/// legacy flat-schema transcript), in which case the caller keeps everything.
+///
+/// The walk is bounded by the number of entries in the map so a malformed
+/// (cyclic) `parentId` chain cannot loop forever.
+fn active_branch_ids(
+    parent_map: &std::collections::HashMap<String, Option<String>>,
+    last_entry_id: Option<&str>,
+) -> Option<std::collections::HashSet<String>> {
+    let mut branch = std::collections::HashSet::new();
+    let mut current = last_entry_id.map(str::to_string)?;
+    loop {
+        if !branch.insert(current.clone()) {
+            // Cycle: we have seen this id already.
+            return Some(branch);
+        }
+        match parent_map.get(&current) {
+            Some(Some(parent)) => current = parent.clone(),
+            Some(None) | None => return Some(branch),
+        }
+    }
 }
 
 /// Adapt a legacy flat-schema record (`{"role":..., "content":..., ...}` with
@@ -386,31 +476,18 @@ fn content_chars(content: &serde_json::Value) -> usize {
 }
 
 /// Canonicalize the model id for pricing. Command Code reports gateway ids such
-/// as `MiniMaxAI/MiniMax-M3-Free`; the `-Free` suffix is a temporary promo and
-/// the org prefix is not a key tokscale's pricing resolver recognizes verbatim.
-/// Dropping the org segment yields the real paid model (e.g. `MiniMax-M3`) so
-/// output pricing resolves; the provider hint that the org segment carried
-/// (e.g. `minimax`) is recovered separately by [`provider_hint_for_model`] and
-/// applied to `provider_id`, so pricing keys like `minimax/minimax-m3` are
-/// still reached.
+/// as `MiniMaxAI/MiniMax-M3-Free`; the org prefix is not a key tokscale's
+/// pricing resolver recognizes verbatim, so dropping the org segment yields the
+/// model id (e.g. `MiniMax-M3-Free`) that pricing keys are matched against.
+/// The provider hint that the org segment carried (e.g. `minimax`) is recovered
+/// separately by [`provider_hint_for_model`] from the RAW id and applied to
+/// `provider_id`.
+///
+/// No `-free` suffix stripping happens here: `poolside/laguna-s-2.1-free` is a
+/// real catalog id, so stripping the suffix would invent a model that does not
+/// exist. Whatever the id says is what pricing must match.
 fn canonicalize_model(model: &str) -> String {
-    let base = model.rsplit('/').next().unwrap_or(model);
-    // Char-safe, case-insensitive suffix strip. The original code byte-sliced
-    // `base[base.len() - N..]` guarded only by a length check, which panics on a
-    // non-ASCII model id from the untrusted `~/.commandcode/config.json` when
-    // the byte index lands mid-codepoint. `-free` is pure ASCII, so when the
-    // lowercased tail matches, the matched bytes are guaranteed ASCII and
-    // `base.len() - PROMO_SUFFIX.len()` is a valid char boundary.
-    const PROMO_SUFFIX: &str = "-free";
-    if base.len() > PROMO_SUFFIX.len()
-        && base
-            .get(base.len() - PROMO_SUFFIX.len()..)
-            .is_some_and(|tail| tail.eq_ignore_ascii_case(PROMO_SUFFIX))
-    {
-        base[..base.len() - PROMO_SUFFIX.len()].to_string()
-    } else {
-        base.to_string()
-    }
+    model.rsplit('/').next().unwrap_or(model).to_string()
 }
 
 /// Recover the provider hint that the model id carries (e.g.
@@ -481,6 +558,7 @@ mod tests {
     /// authoritative usage and cost.
     fn assistant_line(
         id: &str,
+        parent: &str,
         timestamp: &str,
         model: &str,
         text: &str,
@@ -492,7 +570,7 @@ mod tests {
         json!({
             "type": "message",
             "id": id,
-            "parentId": null,
+            "parentId": parent,
             "timestamp": timestamp,
             "message": {
                 "role": "assistant",
@@ -510,11 +588,11 @@ mod tests {
         .to_string()
     }
 
-    fn user_line(id: &str, timestamp: &str, text: &str) -> String {
+    fn user_line(id: &str, parent: &str, timestamp: &str, text: &str) -> String {
         json!({
             "type": "message",
             "id": id,
-            "parentId": null,
+            "parentId": parent,
             "timestamp": timestamp,
             "message": {
                 "role": "user",
@@ -525,11 +603,17 @@ mod tests {
     }
 
     /// A tool-result record, as Command Code writes it after a tool call.
-    fn tool_result_line(id: &str, timestamp: &str, tool_use_id: &str, text: &str) -> String {
+    fn tool_result_line(
+        id: &str,
+        parent: &str,
+        timestamp: &str,
+        tool_use_id: &str,
+        text: &str,
+    ) -> String {
         json!({
             "type": "message",
             "id": id,
-            "parentId": null,
+            "parentId": parent,
             "timestamp": timestamp,
             "message": {
                 "role": "user",
@@ -545,6 +629,8 @@ mod tests {
 
     /// Full realistic v3 session: header, model_change, user turn, tool call +
     /// tool result, then the assistant response carrying authoritative usage.
+    /// Every entry chains its `parentId` to the previous one, as real
+    /// transcripts do.
     #[test]
     fn test_parse_realistic_v3_session_with_tool_turns() {
         let dir = TempDir::new().unwrap();
@@ -553,7 +639,7 @@ mod tests {
             "{}\n{}\n{}\n{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "sess-1", "timestamp": "2026-08-31T04:36:38.441Z", "cwd": "/home/al/learning"}),
             json!({"type": "model_change", "id": "m1", "parentId": null, "timestamp": "2026-08-31T04:37:00.000Z", "model": "deepseek/deepseek-v4-flash"}),
-            user_line("u1", "2026-08-31T04:39:16.867Z", "list the repo"),
+            user_line("u1", "m1", "2026-08-31T04:39:16.867Z", "list the repo"),
             json!({
                 "type": "message",
                 "id": "t1",
@@ -580,12 +666,14 @@ mod tests {
             }),
             tool_result_line(
                 "r1",
+                "t1",
                 "2026-08-31T04:39:19.000Z",
                 "call_00_abc",
                 "Found 28 items"
             ),
             assistant_line(
                 "a1",
+                "r1",
                 "2026-08-31T04:39:20.351Z",
                 "deepseek/deepseek-v4-flash",
                 "There are 28 items.",
@@ -600,34 +688,84 @@ mod tests {
         let messages = parse_commandcode_file(&path);
 
         // Two assistant records: the tool_use call (turn start) and the final
-        // text response. Both carry authoritative usage.
+        // text response. Both carry authoritative usage, all on the active
+        // branch (the chain ends at a1 -> r1 -> t1 -> u1 -> m1).
         assert_eq!(messages.len(), 2);
         let tool_call = &messages[0];
         assert_eq!(tool_call.model_id, "deepseek-v4-flash");
         assert_eq!(tool_call.provider_id, "deepseek");
-        // inputTokens 21000 is cache-inclusive: 17000 fresh + 4000 cache read.
-        assert_eq!(tool_call.tokens.input, 17000);
+        // Disjoint buckets: input is the full inputTokens, cache on top.
+        assert_eq!(tool_call.tokens.input, 21000);
         assert_eq!(tool_call.tokens.output, 90);
         assert_eq!(tool_call.tokens.cache_read, 4000);
         assert!((tool_call.cost - 0.002).abs() < 1e-9);
         assert!(tool_call.has_authoritative_cost());
         assert!(tool_call.is_turn_start);
-        assert_eq!(tool_call.dedup_key.as_deref(), Some("sess-1:0"));
+        assert_eq!(tool_call.dedup_key.as_deref(), Some("t1:1788151158000:0"));
 
         let msg = &messages[1];
         assert_eq!(msg.model_id, "deepseek-v4-flash");
         assert_eq!(msg.provider_id, "deepseek");
         assert_eq!(msg.session_id, "sess-1");
-        // Authoritative usage from the assistant line, not estimated from the
-        // tool-result text (which is far larger than 205 output tokens).
-        // 28534 inputTokens is cache-inclusive: 21110 fresh + 7424 cache read.
-        assert_eq!(msg.tokens.input, 21110);
+        // Disjoint buckets: full inputTokens (28534) + output (205), cache on
+        // top, NOT subtracted.
+        assert_eq!(msg.tokens.input, 28534);
         assert_eq!(msg.tokens.output, 205);
         assert_eq!(msg.tokens.cache_read, 7424);
         assert!((msg.cost - 0.006464748).abs() < 1e-9);
         assert!(msg.has_authoritative_cost());
         assert!(!msg.is_turn_start);
-        assert_eq!(msg.dedup_key.as_deref(), Some("sess-1:1"));
+        assert_eq!(msg.dedup_key.as_deref(), Some("a1:1788151160351:1"));
+    }
+
+    /// A `/rewind` abandons a branch: orphaned assistant entries keep their
+    /// `usage` on disk but are NOT on the active parent chain, and must not be
+    /// counted — the vendor's `getBranch()` never sees them.
+    #[test]
+    fn test_abandoned_rewind_branch_entries_are_dropped() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // The active branch is: u1 -> a2 (the last entry). a1 is an orphaned
+        // assistant response from a `/rewind` — its usage must not count.
+        let jsonl = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "original prompt"),
+            assistant_line(
+                "a1",
+                "u1",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "first answer (abandoned by /rewind)",
+                5000,
+                200,
+                1000,
+                0.01
+            ),
+            user_line("u2", "u1", "2026-08-31T00:00:10Z", "actually, redo it"),
+            assistant_line(
+                "a2",
+                "u2",
+                "2026-08-31T00:00:15Z",
+                "model-x",
+                "the real final answer",
+                6000,
+                300,
+                2000,
+                0.02
+            ),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1, "orphaned branch entries must be dropped");
+        let msg = &messages[0];
+        assert_eq!(msg.model_id, "model-x");
+        assert_eq!(msg.tokens.input, 6000);
+        assert_eq!(msg.tokens.output, 300);
+        assert_eq!(msg.tokens.cache_read, 2000);
+        assert!((msg.cost - 0.02).abs() < 1e-9);
+        assert!(msg.is_turn_start);
     }
 
     #[test]
@@ -637,9 +775,10 @@ mod tests {
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "sess-1", "cwd": "/home/al/learning"}),
-            user_line("u1", "2026-08-31T04:39:16.867Z", "hello"),
+            user_line("u1", "", "2026-08-31T04:39:16.867Z", "hello"),
             assistant_line(
                 "a1",
+                "u1",
                 "2026-08-31T04:39:20.351Z",
                 "deepseek/deepseek-v4-flash",
                 "hi there",
@@ -659,16 +798,16 @@ mod tests {
         assert_eq!(msg.provider_id, "deepseek");
         assert_eq!(msg.model_id, "deepseek-v4-flash");
         assert_eq!(msg.session_id, "sess-1");
-        // Authoritative counts, not estimates. `inputTokens` is cache-inclusive
-        // (28534 = 21110 fresh + 7424 cache read), so `input` is the fresh
-        // remainder, exactly like cline/zcode normalize.
-        assert_eq!(msg.tokens.input, 21110);
+        // Authoritative counts, not estimates. Buckets are DISJOINT: input is
+        // the full inputTokens, cache on top (verified: charging full input +
+        // cache at deepseek-v4-flash rates reproduces the recorded costUsd
+        // exactly; subtracting cache does not).
+        assert_eq!(msg.tokens.input, 28534);
         assert_eq!(msg.tokens.output, 205);
         assert_eq!(msg.tokens.cache_read, 7424);
         assert_eq!(msg.tokens.cache_write, 0);
         assert_eq!(msg.tokens.reasoning, 0);
-        // Non-overlapping buckets: total() must not double-count the cache.
-        assert_eq!(msg.tokens.total(), 28739); // 21110 + 205 + 7424
+        assert_eq!(msg.tokens.total(), 36163); // 28534 + 205 + 7424
                                                // Authoritative cost is embedded and marked provider-reported.
         assert!((msg.cost - 0.006464748).abs() < 1e-9);
         assert!(msg.has_authoritative_cost());
@@ -683,12 +822,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write_config(&dir, "deepseek/deepseek-v4-flash");
         let jsonl = format!(
-            "{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "sess-1"}),
-            json!({"type": "model_change", "id": "m1", "timestamp": "2026-08-31T03:32:29.603Z", "model": "minimax/minimax-m3-free"}),
-            user_line("u1", "2026-08-31T03:33:00.000Z", "first"),
+            json!({"type": "model_change", "id": "m1", "parentId": null, "timestamp": "2026-08-31T03:32:29.603Z", "model": "minimax/minimax-m3-free"}),
+            user_line("u1", "m1", "2026-08-31T03:33:00.000Z", "first"),
             assistant_line(
                 "a1",
+                "u1",
                 "2026-08-31T03:33:05.000Z",
                 "minimax/minimax-m3-free",
                 "resp one",
@@ -697,7 +837,6 @@ mod tests {
                 0,
                 0.001
             ),
-            json!({"type": "model_change", "id": "m2", "timestamp": "2026-08-31T03:34:07.747Z", "model": "deepseek/deepseek-v4-flash"}),
         );
         let path = write_session(&dir, "proj", "sess-1", &jsonl);
 
@@ -705,30 +844,37 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         // The model in effect at the assistant line is the model_change one.
-        assert_eq!(messages[0].model_id, "minimax-m3");
+        // `-free` is NOT stripped: `poolside/laguna-s-2.1-free` is a real
+        // catalog id, so the suffix is preserved for pricing.
+        assert_eq!(messages[0].model_id, "minimax-m3-free");
         assert_eq!(messages[0].provider_id, "minimax");
     }
 
     #[test]
-    fn test_canonicalize_model_strips_org_prefix_and_free_promo_suffix() {
+    fn test_canonicalize_model_strips_org_prefix_only() {
         assert_eq!(
             canonicalize_model("MiniMaxAI/MiniMax-M3-Free"),
-            "MiniMax-M3"
+            "MiniMax-M3-Free"
         );
         assert_eq!(
             canonicalize_model("minimaxai/minimax-m3-free"),
-            "minimax-m3"
+            "minimax-m3-free"
         );
         assert_eq!(canonicalize_model("MiniMaxAI/MiniMax-M2.5"), "MiniMax-M2.5");
         assert_eq!(canonicalize_model("taste-1"), "taste-1");
-        assert_eq!(canonicalize_model("MiniMax-M3-FrEe"), "MiniMax-M3");
+        // `-free` is a real catalog suffix (poolside/laguna-s-2.1-free), so it
+        // must NOT be stripped.
+        assert_eq!(
+            canonicalize_model("poolside/laguna-s-2.1-free"),
+            "laguna-s-2.1-free"
+        );
     }
 
     #[test]
     fn test_canonicalize_model_does_not_panic_on_non_ascii() {
         assert_eq!(canonicalize_model("vendor/modèle"), "modèle");
         assert_eq!(canonicalize_model("café-🚀"), "café-🚀");
-        assert_eq!(canonicalize_model("café-free"), "café");
+        assert_eq!(canonicalize_model("café-free"), "café-free");
     }
 
     #[test]
@@ -762,8 +908,18 @@ mod tests {
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
-            user_line("u1", "2026-08-31T00:00:00Z", "hello"),
-            assistant_line("a1", "2026-08-31T00:00:05Z", "", "world", 10, 5, 0, 0.0),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hello"),
+            assistant_line(
+                "a1",
+                "u1",
+                "2026-08-31T00:00:05Z",
+                "",
+                "world",
+                10,
+                5,
+                0,
+                0.0
+            ),
         );
         let path = write_session(&dir, "proj", "s", &jsonl);
 
@@ -798,12 +954,14 @@ mod tests {
             json!({
                 "type": "message",
                 "id": "u1",
+                "parentId": null,
                 "timestamp": "2026-08-31T00:00:00Z",
                 "message": {"role": "user", "content": [{"type": "text", "text": "12345678"}]}
             }),
             json!({
                 "type": "message",
                 "id": "a1",
+                "parentId": "u1",
                 "timestamp": "2026-08-31T00:00:05Z",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "abcd"}]},
                 "model": "model-x"
@@ -841,10 +999,11 @@ mod tests {
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
-            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hi"),
             json!({
                 "type": "message",
                 "id": "a1",
+                "parentId": "u1",
                 "timestamp": "2026-08-31T00:00:05Z",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
                 "usage": {
@@ -867,23 +1026,25 @@ mod tests {
             msg.has_authoritative_cost(),
             "an explicit zero cost is provider-reported, not repriced"
         );
-        // The free-promo model still canonicalizes (org + suffix stripped).
-        assert_eq!(msg.model_id, "minimax-m3");
+        // Org prefix stripped; `-free` suffix preserved (real catalog id).
+        assert_eq!(msg.model_id, "minimax-m3-free");
     }
 
-    /// `inputTokens` is cache-inclusive, so the breakdown must subtract the
-    /// cache buckets from input — otherwise `total()` double-counts cache.
+    /// The usage buckets are DISJOINT: `inputTokens` is cache-exclusive and the
+    /// cache buckets are billed on top, so `total()` sums them without any
+    /// subtraction (verified against the recorded `costUsd` arithmetic).
     #[test]
-    fn test_usage_input_is_cache_inclusive() {
+    fn test_usage_buckets_are_disjoint() {
         let dir = TempDir::new().unwrap();
         write_config(&dir, "model-x");
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
-            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hi"),
             json!({
                 "type": "message",
                 "id": "a1",
+                "parentId": "u1",
                 "timestamp": "2026-08-31T00:00:05Z",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
                 "usage": {
@@ -901,12 +1062,12 @@ mod tests {
         let messages = parse_commandcode_file(&path);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
-        // 1000 inputTokens = 90 fresh + 900 cache read + 10 cache write.
-        assert_eq!(msg.tokens.input, 90);
+        // Full inputTokens passed through verbatim; cache on top.
+        assert_eq!(msg.tokens.input, 1000);
         assert_eq!(msg.tokens.cache_read, 900);
         assert_eq!(msg.tokens.cache_write, 10);
-        // Non-overlapping: total() is fresh + output + both caches, no double count.
-        assert_eq!(msg.tokens.total(), 1050);
+        // total() is the sum of all buckets, no double-count and no subtraction.
+        assert_eq!(msg.tokens.total(), 1960);
     }
 
     /// A dropped zero-total assistant line must not consume the turn-start
@@ -925,12 +1086,14 @@ mod tests {
             json!({
                 "type": "message",
                 "id": "a0",
+                "parentId": null,
                 "timestamp": "2026-08-31T00:00:01Z",
                 "message": {"role": "assistant", "content": []}
             }),
-            user_line("u1", "2026-08-31T00:00:02Z", "hi"),
+            user_line("u1", "a0", "2026-08-31T00:00:02Z", "hi"),
             assistant_line(
                 "a1",
+                "u1",
                 "2026-08-31T00:00:05Z",
                 "model-x",
                 "response",
@@ -966,7 +1129,8 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         assert_eq!(msg.client, "commandcode");
-        assert_eq!(msg.model_id, "MiniMax-M3");
+        // Org prefix stripped; `-free` preserved (real catalog id).
+        assert_eq!(msg.model_id, "MiniMax-M3-Free");
         assert_eq!(msg.provider_id, "minimax");
         assert_eq!(msg.session_id, "sess-1");
         assert_eq!(
@@ -990,10 +1154,11 @@ mod tests {
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
-            user_line("u1", "2026-08-31T00:00:00Z", "12345678"),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "12345678"),
             json!({
                 "type": "message",
                 "id": "a1",
+                "parentId": "u1",
                 "timestamp": "2026-08-31T00:00:05Z",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "abcd"}]},
                 "usage": {},
@@ -1027,10 +1192,11 @@ mod tests {
         let jsonl = format!(
             "{}\n{}\n{}",
             json!({"type": "session", "version": 3, "id": "s"}),
-            user_line("u1", "2026-08-31T00:00:00Z", "hi"),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hi"),
             json!({
                 "type": "message",
                 "id": "a1",
+                "parentId": "u1",
                 "timestamp": "2026-08-31T00:00:05Z",
                 "message": {"role": "assistant", "content": [{"type": "text", "text": "yo"}]},
                 "usage": {
@@ -1049,10 +1215,10 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
         // Clamped to the ceiling; no overflow, no i64::MAX poisoning.
-        assert_eq!(msg.tokens.input, 0); // 1e12 - (1e12 + 1e12) clamped to 0
+        assert_eq!(msg.tokens.input, 1_000_000_000_000);
         assert_eq!(msg.tokens.output, 1_000_000_000_000);
         assert_eq!(msg.tokens.cache_read, 1_000_000_000_000);
-        assert_eq!(msg.tokens.total(), 3_000_000_000_000);
+        assert_eq!(msg.tokens.total(), 4_000_000_000_000);
         // Absurd cost rejected: not provider-reported, so pricing applies.
         assert_eq!(msg.cost, 0.0);
         assert!(!msg.has_authoritative_cost());

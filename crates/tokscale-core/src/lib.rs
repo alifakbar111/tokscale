@@ -2221,10 +2221,12 @@ fn parse_all_messages_with_pricing_with_cache_policy(
     // provider-reported cost when present. Reprice only messages that carry no
     // embedded cost, mirroring the gjc/junie lanes' guards. The model id comes
     // from the transcript's own `model`/`model_change` records (canonicalized,
-    // e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3"), falling back to
+    // e.g. "MiniMaxAI/MiniMax-M3-Free" -> "MiniMax-M3-Free"), falling back to
     // ~/.commandcode/config.json, so the source cache — which fingerprints only
     // the transcript file — is bypassed: otherwise a model change would leave
-    // stale cached pricing until the transcript itself changed.
+    // stale cached pricing until the transcript itself changed. Message-level
+    // dedup collapses `/fork`/`/clone` copies of the same entries across files.
+    let mut commandcode_seen: HashSet<String> = HashSet::new();
     let commandcode_messages: Vec<UnifiedMessage> = scan_result
         .get(ClientId::CommandCode)
         .par_iter()
@@ -2240,7 +2242,11 @@ fn parse_all_messages_with_pricing_with_cache_policy(
                 .collect::<Vec<_>>()
         })
         .collect();
-    all_messages.extend(commandcode_messages);
+    all_messages.extend(
+        commandcode_messages
+            .into_iter()
+            .filter(|message| should_keep_deduped_message(&mut commandcode_seen, message)),
+    );
 
     // gjc (gajae-code) JSONL sessions. Binding note N1: this cached cluster
     // MUST obtain messages via the non-repricing parser and apply the A1
