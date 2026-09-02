@@ -326,6 +326,8 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     // The client's own `command-code` provider is not a pricing
                     // provider; falls back to it when nothing is inferred.
                     let provider_id = provider_hint_for_model(&raw_model).unwrap_or(PROVIDER_ID);
+                    // The message's anchor timestamp falls back to the file
+                    // mtime when the entry has none.
                     let timestamp = entry
                         .timestamp
                         .as_deref()
@@ -343,12 +345,25 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     // safe global key — combining it with the timestamp makes
                     // a collision across genuinely distinct entries effectively
                     // impossible while still matching a fork copy byte-for-byte.
+                    //
+                    // The key uses the entry's OWN parsed timestamp, not the
+                    // message anchor: a missing/invalid timestamp falls back to
+                    // the per-file mtime, which differs between the original and
+                    // a forked copy and would break dedup. Absent/invalid
+                    // timestamps use a stable "missing" sentinel instead, which
+                    // a fork preserves verbatim.
+                    //
                     // Legacy flat-schema lines carry no entry id and fall back
                     // to the session-scoped positional key.
+                    let dedup_timestamp = entry
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_ms)
+                        .unwrap_or(-1);
                     let dedup_key = entry
                         .id
                         .as_deref()
-                        .map(|id| format!("{}:{}", id, timestamp));
+                        .map(|id| format!("{}:{}", id, dedup_timestamp));
                     let mut message = UnifiedMessage::new_with_dedup(
                         CLIENT_ID,
                         resolved_model,
@@ -848,6 +863,71 @@ mod tests {
             assistant_msgs.len(),
             1,
             "fork copy of the same entry must collapse to one message"
+        );
+        assert_eq!(assistant_msgs[0].tokens.input, 100);
+    }
+
+    /// A fork copy whose entries have NO timestamp (or an unparseable one)
+    /// must still dedup: the key uses a stable sentinel, not the per-file
+    /// mtime, so the original and the copy agree.
+    #[test]
+    fn test_fork_with_missing_timestamp_still_dedups() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // Both files carry the same assistant entry with NO timestamp field.
+        // The files' mtimes differ, but the dedup key must not depend on them.
+        let make_session = |session_id: &str| {
+            format!(
+                "{}\n{}\n{}",
+                json!({"type": "session", "version": 3, "id": session_id}),
+                json!({
+                    "type": "message",
+                    "id": "u1",
+                    "parentId": null,
+                    "message": {"role": "user", "content": [{"type": "text", "text": "prompt"}]}
+                }),
+                json!({
+                    "type": "message",
+                    "id": "a1",
+                    "parentId": "u1",
+                    "message": {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                    "usage": {
+                        "inputTokens": 100,
+                        "outputTokens": 10,
+                        "cacheReadTokens": 0,
+                        "cacheWriteTokens": 0,
+                        "costUsd": 0.001
+                    },
+                    "model": "model-x"
+                }),
+            )
+        };
+        let original = make_session("orig-sess");
+        // Write the fork AFTER a small delay so its mtime definitely differs.
+        let orig_path = write_session(&dir, "proj", "orig", &original);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let fork = make_session("fork-sess");
+        let fork_path = write_session(&dir, "proj", "fork", &fork);
+
+        let mut seen = std::collections::HashSet::new();
+        let mut merged: Vec<UnifiedMessage> = Vec::new();
+        for path in [orig_path, fork_path] {
+            for msg in parse_commandcode_file(&path) {
+                let keep = msg
+                    .dedup_key
+                    .as_ref()
+                    .is_none_or(|key| seen.insert(key.clone()));
+                if keep {
+                    merged.push(msg);
+                }
+            }
+        }
+
+        let assistant_msgs: Vec<_> = merged.iter().filter(|m| m.model_id == "model-x").collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "fork copy without timestamps must still collapse to one message"
         );
         assert_eq!(assistant_msgs[0].tokens.input, 100);
     }
