@@ -84,6 +84,8 @@ struct CommandCodeEntry {
     /// Legacy flat-schema fields: `{"role":..., "content":..., "sessionId":...}`.
     role: Option<String>,
     content: Option<serde_json::Value>,
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,9 +225,15 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
 
         // The session id comes from the `session` header record. A message
         // record's `id` is a per-message UUID, not a session id — never use it
-        // as a fallback when the header is missing/corrupt.
+        // as a fallback when the header is missing/corrupt. Legacy flat-schema
+        // lines carry no header but embed a real `sessionId` field, which is
+        // used when no header has been seen.
         if entry.record_type.as_deref() == Some("session") {
             if let Some(id) = entry.id.as_deref().filter(|id| !id.is_empty()) {
+                session_id = Some(id.to_string());
+            }
+        } else if session_id.is_none() {
+            if let Some(id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
                 session_id = Some(id.to_string());
             }
         }
@@ -328,18 +336,19 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                     // Dedup key. A `/fork`/`/clone` copies entries — with their
                     // per-entry `id` and `timestamp` preserved — into a new
                     // session file and leaves the original, so keying on the
-                    // entry id + timestamp collapses the copies across files.
-                    // The vendor's entry id is `randomUUID().slice(0,8)` (32
-                    // bits, unique only within one session), so a bare id is
-                    // NOT a safe global key — combining it with the timestamp
-                    // makes a collision across genuinely distinct entries
-                    // effectively impossible while still matching a fork copy
-                    // byte-for-byte. Legacy flat-schema lines carry no entry id
-                    // and fall back to the positional key.
+                    // entry id + timestamp collapses the copies across files
+                    // regardless of their position in the new file. The
+                    // vendor's entry id is `randomUUID().slice(0,8)` (32 bits,
+                    // unique only within one session), so a bare id is NOT a
+                    // safe global key — combining it with the timestamp makes
+                    // a collision across genuinely distinct entries effectively
+                    // impossible while still matching a fork copy byte-for-byte.
+                    // Legacy flat-schema lines carry no entry id and fall back
+                    // to the session-scoped positional key.
                     let dedup_key = entry
                         .id
                         .as_deref()
-                        .map(|id| format!("{}:{}:{}", id, timestamp, assistant_index));
+                        .map(|id| format!("{}:{}", id, timestamp));
                     let mut message = UnifiedMessage::new_with_dedup(
                         CLIENT_ID,
                         resolved_model,
@@ -701,7 +710,7 @@ mod tests {
         assert!((tool_call.cost - 0.002).abs() < 1e-9);
         assert!(tool_call.has_authoritative_cost());
         assert!(tool_call.is_turn_start);
-        assert_eq!(tool_call.dedup_key.as_deref(), Some("t1:1788151158000:0"));
+        assert_eq!(tool_call.dedup_key.as_deref(), Some("t1:1788151158000"));
 
         let msg = &messages[1];
         assert_eq!(msg.model_id, "deepseek-v4-flash");
@@ -715,7 +724,7 @@ mod tests {
         assert!((msg.cost - 0.006464748).abs() < 1e-9);
         assert!(msg.has_authoritative_cost());
         assert!(!msg.is_turn_start);
-        assert_eq!(msg.dedup_key.as_deref(), Some("a1:1788151160351:1"));
+        assert_eq!(msg.dedup_key.as_deref(), Some("a1:1788151160351"));
     }
 
     /// A `/rewind` abandons a branch: orphaned assistant entries keep their
@@ -766,6 +775,81 @@ mod tests {
         assert_eq!(msg.tokens.cache_read, 2000);
         assert!((msg.cost - 0.02).abs() < 1e-9);
         assert!(msg.is_turn_start);
+    }
+
+    /// A `/fork` copies entries (same `id` + `timestamp`) into a new session
+    /// file leaving the original. The dedup key must be identical for both so
+    /// `should_keep_deduped_message` collapses them across files — regardless
+    /// of position in the copied file.
+    #[test]
+    fn test_fork_copies_share_dedup_key() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // Original session: u1 -> a1 (the last entry).
+        let original = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "orig-sess"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "prompt"),
+            assistant_line(
+                "a1",
+                "u1",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "answer",
+                100,
+                10,
+                0,
+                0.001
+            ),
+        );
+        // Fork: same entries, but a NEW session id and the assistant copied at
+        // a DIFFERENT position (an extra user turn precedes the copy).
+        let fork = format!(
+            "{}\n{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "fork-sess"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "prompt"),
+            user_line("u2", "u1", "2026-08-31T00:00:02Z", "extra turn"),
+            assistant_line(
+                "a1",
+                "u2",
+                "2026-08-31T00:00:05Z",
+                "model-x",
+                "answer",
+                100,
+                10,
+                0,
+                0.001
+            ),
+        );
+
+        let orig_path = write_session(&dir, "proj", "orig", &original);
+        let fork_path = write_session(&dir, "proj", "fork", &fork);
+
+        // Parse both files into one merged stream, collapsing duplicates by
+        // dedup key the same way the lib.rs lane's should_keep_deduped_message
+        // does.
+        let mut seen = std::collections::HashSet::new();
+        let mut merged: Vec<UnifiedMessage> = Vec::new();
+        for path in [orig_path, fork_path] {
+            for msg in parse_commandcode_file(&path) {
+                let keep = msg
+                    .dedup_key
+                    .as_ref()
+                    .is_none_or(|key| seen.insert(key.clone()));
+                if keep {
+                    merged.push(msg);
+                }
+            }
+        }
+
+        // The assistant entry appears in both files; it must be counted once.
+        let assistant_msgs: Vec<_> = merged.iter().filter(|m| m.model_id == "model-x").collect();
+        assert_eq!(
+            assistant_msgs.len(),
+            1,
+            "fork copy of the same entry must collapse to one message"
+        );
+        assert_eq!(assistant_msgs[0].tokens.input, 100);
     }
 
     #[test]
@@ -1113,16 +1197,19 @@ mod tests {
     }
 
     /// Legacy flat-schema transcripts (`{"role":..., "content":...}` with no
-    /// `type`/`message` nesting) still parse via estimation.
+    /// `type`/`message` nesting) still parse via estimation, and their embedded
+    /// `sessionId` is honored even when it differs from the filename.
     #[test]
     fn test_legacy_flat_schema_still_parses_with_estimation() {
         let dir = TempDir::new().unwrap();
         write_config(&dir, "MiniMaxAI/MiniMax-M3-Free");
         let jsonl = concat!(
-            r#"{"role":"user","sessionId":"sess-1","content":[{"type":"text","text":"12345678"}]}"#,
+            r#"{"role":"user","sessionId":"legacy-session-42","content":[{"type":"text","text":"12345678"}]}"#,
             "\n",
-            r#"{"role":"assistant","sessionId":"sess-1","content":[{"type":"text","text":"abcd"}]}"#,
+            r#"{"role":"assistant","sessionId":"legacy-session-42","content":[{"type":"text","text":"abcd"}]}"#,
         );
+        // The FILE is named `sess-1.jsonl`, but the transcript's sessionId is
+        // `legacy-session-42` — the parser must use the embedded id.
         let path = write_session(&dir, "proj", "sess-1", &jsonl);
 
         let messages = parse_commandcode_file(&path);
@@ -1132,7 +1219,7 @@ mod tests {
         // Org prefix stripped; `-free` preserved (real catalog id).
         assert_eq!(msg.model_id, "MiniMax-M3-Free");
         assert_eq!(msg.provider_id, "minimax");
-        assert_eq!(msg.session_id, "sess-1");
+        assert_eq!(msg.session_id, "legacy-session-42");
         assert_eq!(
             msg.tokens.input,
             estimate_tokens(content_chars(
