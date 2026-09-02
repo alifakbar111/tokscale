@@ -325,14 +325,30 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                         });
                     turn_input_chars = 0;
 
-                    if breakdown.total() == 0 {
-                        // Nothing was used, so nothing is billed. This drop is
-                        // load-bearing for reported zeros: it returns BEFORE
-                        // `reported_cost()` below, so an all-zero turn cannot
-                        // emit a $0.00 provider-reported row (which would mark
-                        // the day's cost complete on a message that records no
-                        // usage). It matches the vendor's accounting, where
-                        // adding a zero bucket and a zero cost are both no-ops.
+                    // Read the authoritative cost BEFORE the all-zero drop
+                    // below: whether a cost was billed is what decides
+                    // whether the drop applies at all.
+                    let cost = entry.usage.as_ref().and_then(|u| u.reported_cost());
+
+                    if breakdown.total() == 0 && !cost.is_some_and(|usd| usd > 0.0) {
+                        // Nothing was used and nothing was billed, so there is
+                        // nothing to record. This drop is load-bearing for
+                        // reported zeros: it keeps an all-zero turn from
+                        // emitting a $0.00 provider-reported row, which would
+                        // mark the day's cost complete on a message that
+                        // records no usage. It matches the vendor's
+                        // accounting, where adding a zero bucket and a zero
+                        // cost are both no-ops.
+                        //
+                        // A *positive* `costUsd` on the same all-zero line is
+                        // the exception, and is why the cost is read first.
+                        // Some providers bill per request rather than per
+                        // token, and a client that failed to parse a usage
+                        // block still records what it was charged, so zero
+                        // buckets alongside real money is a shape that
+                        // occurs. Dropping it would discard recorded spend,
+                        // so it is emitted as a zero-token provider-reported
+                        // row instead.
                         //
                         // No message is emitted, so the next real assistant
                         // message in this turn must keep its is_turn_start
@@ -371,7 +387,6 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                         .and_then(parse_rfc3339_ms)
                         .unwrap_or(fallback_timestamp);
 
-                    let cost = entry.usage.as_ref().and_then(|u| u.reported_cost());
                     // Dedup key. A `/fork`/`/clone` copies entries — with their
                     // per-entry `id` and `timestamp` preserved — into a new
                     // session file and leaves the original, so keying on the
@@ -409,8 +424,23 @@ pub fn parse_commandcode_file(path: &Path) -> Vec<UnifiedMessage> {
                         timestamp,
                         breakdown,
                         cost.unwrap_or(0.0),
-                        dedup_key
-                            .or_else(|| Some(format!("{}:{}", resolved_session, assistant_index))),
+                        dedup_key.or_else(|| {
+                            // Positional fallback for legacy flat-schema
+                            // lines, which carry no entry id.
+                            // `resolved_session` can itself fall back to the
+                            // file stem, and two projects can hold files with
+                            // the same stem, so the workspace is folded in to
+                            // keep the key unique across directories. This
+                            // key only has to be unique: a legacy `/fork`
+                            // lands in a differently-named file, so unlike
+                            // the id-based key it never collapses copies.
+                            Some(format!(
+                                "{}:{}:{}",
+                                workspace_key.as_deref().unwrap_or("-"),
+                                resolved_session,
+                                assistant_index
+                            ))
+                        }),
                     );
                     message.message_count = 1;
                     message.is_turn_start = pending_turn_start;
@@ -1656,6 +1686,97 @@ mod tests {
             estimate_tokens(content_chars(&json!([{"type": "text", "text": "abcd"}])))
         );
         assert!(!msg.has_authoritative_cost());
+    }
+
+    /// An all-zero usage block carrying a *positive* `costUsd` is real spend
+    /// and must survive the all-zero drop.
+    ///
+    /// Regression guard. The drop used to run before the cost was read, so a
+    /// line like this vanished and took its recorded charge with it. Zero
+    /// buckets next to a non-zero cost is a shape that occurs: providers that
+    /// bill per request report no token counts, and a client that failed to
+    /// parse a usage block still records what it was charged. Only the
+    /// zero-cost case is a genuine no-op worth dropping.
+    #[test]
+    fn test_all_zero_usage_with_positive_cost_is_kept() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        let jsonl = format!(
+            "{}\n{}\n{}",
+            json!({"type": "session", "version": 3, "id": "s"}),
+            user_line("u1", "", "2026-08-31T00:00:00Z", "hi"),
+            json!({
+                "type": "message",
+                "id": "a1",
+                "parentId": "u1",
+                "timestamp": "2026-08-31T00:00:05Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "billed per request"}]
+                },
+                "usage": {
+                    "inputTokens": 0,
+                    "outputTokens": 0,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "costUsd": 0.42
+                },
+                "model": "model-x"
+            }),
+        );
+        let path = write_session(&dir, "proj", "s", &jsonl);
+
+        let messages = parse_commandcode_file(&path);
+        assert_eq!(messages.len(), 1, "a billed turn must not be dropped");
+        let msg = &messages[0];
+        assert_eq!(
+            msg.tokens.total(),
+            0,
+            "the provider's zero buckets are kept verbatim, not estimated"
+        );
+        assert_eq!(msg.cost, 0.42);
+        assert!(
+            msg.has_authoritative_cost(),
+            "the recorded charge stays provider-reported"
+        );
+    }
+
+    /// Legacy lines carry no entry id, so their dedup key is positional. Two
+    /// projects can hold identically-named session files, and a legacy line
+    /// with no embedded `sessionId` falls back to the file stem — so the
+    /// positional key has to be qualified by the workspace, or entries from
+    /// the two files collide and the deduping caller deletes real messages.
+    #[test]
+    fn test_legacy_positional_dedup_keys_differ_across_projects() {
+        let dir = TempDir::new().unwrap();
+        write_config(&dir, "model-x");
+        // No `sessionId` field and no header, so `resolved_session` falls back
+        // to the file stem — `chat` in both projects.
+        let jsonl = concat!(
+            r#"{"role":"user","content":[{"type":"text","text":"12345678"}]}"#,
+            "\n",
+            r#"{"role":"assistant","content":[{"type":"text","text":"abcd"}]}"#,
+        );
+        let a = write_session(&dir, "project-a", "chat", jsonl);
+        let b = write_session(&dir, "project-b", "chat", jsonl);
+
+        let keys = |path: &std::path::Path| {
+            parse_commandcode_file(path)
+                .into_iter()
+                .map(|m| {
+                    m.dedup_key
+                        .expect("a legacy line still gets a positional dedup key")
+                })
+                .collect::<Vec<_>>()
+        };
+        let keys_a = keys(&a);
+        let keys_b = keys(&b);
+        assert_eq!(keys_a.len(), 1);
+        assert_eq!(keys_b.len(), 1);
+        assert_ne!(
+            keys_a[0], keys_b[0],
+            "identically-named legacy sessions in different projects must not share a dedup key"
+        );
     }
 
     /// An empty `usage` block on an assistant line falls back to estimation.
