@@ -580,6 +580,10 @@ mod tests {
 
     /// Build a realistic v3 transcript line for an assistant response carrying
     /// authoritative usage and cost.
+    // A fixture builder whose parameters mirror the transcript's own fields;
+    // grouping them into a struct would only move the same list one level out.
+    // Same treatment as `zed::tests::insert_thread`.
+    #[allow(clippy::too_many_arguments)]
     fn assistant_line(
         id: &str,
         parent: &str,
@@ -1290,7 +1294,7 @@ mod tests {
         );
         // The FILE is named `sess-1.jsonl`, but the transcript's sessionId is
         // `legacy-session-42` — the parser must use the embedded id.
-        let path = write_session(&dir, "proj", "sess-1", &jsonl);
+        let path = write_session(&dir, "proj", "sess-1", jsonl);
 
         let messages = parse_commandcode_file(&path);
         assert_eq!(messages.len(), 1);
